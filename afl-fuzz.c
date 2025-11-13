@@ -42,11 +42,13 @@
 #include "debug.h"
 #include "alloc-inl.h"
 #include "hash.h"
+#include "afl-fuzz.h"
 
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <errno.h>
 #include <signal.h>
@@ -71,6 +73,25 @@
 #include "aflnet.h"
 #include <graphviz/gvc.h>
 #include <math.h>
+
+#define MUTATOR_MI_DEFAULT_MAX_LEN         65536U
+#define MUTATOR_MI_RECORD_DEFAULT          2048U
+#define MUTATOR_TWISE_DEFAULT_STRENGTH     2U
+#define MUTATOR_TWISE_DEFAULT_MAX_POS      32U
+#define MUTATOR_TWISE_DEFAULT_TEMPLATES    128U
+#define MUTATOR_TWISE_DEFAULT_EXEC_ROUNDS  2U
+#define MUTATOR_BANDIT_DEFAULT_ARMS        32U
+#define MUTATOR_BANDIT_DEFAULT_HISTORY     64U
+#define MUTATOR_DIR_DEFAULT_DICT_SIZE      256U
+#define MUTATOR_DIR_DEFAULT_MAX_DIFF       32U
+#define MUTATOR_DIR_DEFAULT_COMBINE        3U
+#define MUTATOR_DIR_DEFAULT_EXEC_ROUNDS    8U
+
+enum {
+  TWISE_CAT_NORMAL = 0,
+  TWISE_CAT_BOUNDARY,
+  TWISE_CAT_RANDOM
+};
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
 #  include <sys/sysctl.h>
@@ -216,6 +237,266 @@ static u32 syncing_case;              /* Syncing with case #...           */
 
 static s32 stage_cur_byte,            /* Byte offset of current stage op  */
            stage_cur_val;             /* Value used for stage op          */
+
+static afl_state_t mutator_state;
+static u8          mutator_mode_from_cli;
+
+static void init_mutator_state(afl_state_t* afl) {
+
+  memset(afl, 0, sizeof(*afl));
+
+  afl->mutator_modes           = MUT_MODE_DEFAULT;
+  afl->sa_steps                = 16;
+  afl->sa_min_stack            = 1;
+  afl->sa_max_stack            = 4;
+  afl->sa_noise_ops            = 1;
+  afl->sa_T0                   = 5.0;
+  afl->sa_Tmin                 = 0.5;
+  afl->sa_decay                = 0.95;
+  afl->sa_iteration_count      = 0;
+
+  afl->mi_max_len              = MUTATOR_MI_DEFAULT_MAX_LEN;
+  afl->mi_record_cap           = MUTATOR_MI_RECORD_DEFAULT;
+  afl->mi_base_hit             = 1.0;
+  afl->mi_base_mut             = 1.0;
+  afl->mi_weight_total         = 0.0;
+  afl->collect_offsets         = 0;
+
+  afl->twise_strength          = MUTATOR_TWISE_DEFAULT_STRENGTH;
+  afl->twise_max_positions     = MUTATOR_TWISE_DEFAULT_MAX_POS;
+  afl->twise_max_templates     = MUTATOR_TWISE_DEFAULT_TEMPLATES;
+  afl->twise_execs_per_template = MUTATOR_TWISE_DEFAULT_EXEC_ROUNDS;
+  afl->twise_pos_cnt           = 0;
+  afl->twise_templates_cnt     = 0;
+  afl->twise_last_len          = 0;
+  afl->twise_dirty             = 1;
+
+  afl->bandit_max_arms         = MUTATOR_BANDIT_DEFAULT_ARMS;
+  afl->bandit_explore          = 1.5;
+  afl->bandit_total_pulls      = 0;
+  afl->bandit_op_cap           = MUTATOR_BANDIT_DEFAULT_HISTORY;
+  afl->bandit_op_count         = 0;
+
+  afl->dir_dict_size           = MUTATOR_DIR_DEFAULT_DICT_SIZE;
+  afl->dir_max_diff            = MUTATOR_DIR_DEFAULT_MAX_DIFF;
+  afl->dir_max_combine         = MUTATOR_DIR_DEFAULT_COMBINE;
+  afl->dir_execs_per_combo     = MUTATOR_DIR_DEFAULT_EXEC_ROUNDS;
+  afl->dir_dict_count          = 0;
+  afl->dir_dict_next           = 0;
+  afl->dir_base_ptr            = NULL;
+  afl->dir_base_len            = 0;
+  afl->dir_candidate_ptr       = NULL;
+  afl->dir_candidate_len       = 0;
+  afl->dir_collect             = 0;
+
+}
+
+static void configure_mutator_state(afl_state_t* afl) {
+
+  char* env;
+
+  env = getenv("AFL_SA_STEPS");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val) afl->sa_steps = val;
+  }
+
+  env = getenv("AFL_SA_STACK_MIN");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val) afl->sa_min_stack = val;
+  }
+
+  env = getenv("AFL_SA_STACK_MAX");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val) afl->sa_max_stack = val;
+  }
+
+  if (afl->sa_min_stack > afl->sa_max_stack)
+    afl->sa_min_stack = afl->sa_max_stack;
+
+  env = getenv("AFL_SA_NOISE");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    afl->sa_noise_ops = val;
+  }
+
+  env = getenv("AFL_SA_T0");
+  if (env) {
+    double val = atof(env);
+    if (val > 0.0) afl->sa_T0 = val;
+  }
+
+  env = getenv("AFL_SA_TMIN");
+  if (env) {
+    double val = atof(env);
+    if (val > 0.0) afl->sa_Tmin = val;
+  }
+
+  env = getenv("AFL_SA_DECAY");
+  if (env) {
+    double val = atof(env);
+    if (val > 0.0 && val < 1.0) afl->sa_decay = val;
+  }
+
+  env = getenv("AFL_MI_MAX_LEN");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 1024 && val <= MAX_FILE) afl->mi_max_len = val;
+  }
+
+  env = getenv("AFL_MI_RECORD");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 64) afl->mi_record_cap = val;
+  }
+
+  env = getenv("AFL_MI_BASE_HIT");
+  if (env) {
+    double val = atof(env);
+    if (val >= 0.0) afl->mi_base_hit = val;
+  }
+
+  env = getenv("AFL_MI_BASE_MUT");
+  if (env) {
+    double val = atof(env);
+    if (val >= 0.0) afl->mi_base_mut = val;
+  }
+
+  env = getenv("AFL_TWISE_T");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 1 && val <= 6) afl->twise_strength = val;
+  }
+
+  env = getenv("AFL_TWISE_K");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= afl->twise_strength) afl->twise_max_positions = val;
+  }
+
+  env = getenv("AFL_TWISE_TEMPLATES");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 1) afl->twise_max_templates = val;
+  }
+
+  env = getenv("AFL_TWISE_EXEC");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 1) afl->twise_execs_per_template = val;
+  }
+
+  env = getenv("AFL_BANDIT_C");
+  if (env) {
+    double val = atof(env);
+    if (val > 0.0) afl->bandit_explore = val;
+  }
+
+  env = getenv("AFL_BANDIT_ARMS");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 8) afl->bandit_max_arms = val;
+  }
+
+  env = getenv("AFL_BANDIT_HISTORY");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 8) afl->bandit_op_cap = val;
+  }
+
+  env = getenv("AFL_DIR_DICT_SIZE");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 16) afl->dir_dict_size = val;
+  }
+
+  env = getenv("AFL_DIR_MAX_DIFF");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 1) afl->dir_max_diff = val;
+  }
+
+  env = getenv("AFL_DIR_KMAX");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 1) afl->dir_max_combine = val;
+  }
+
+  env = getenv("AFL_DIR_EXEC");
+  if (env) {
+    u32 val = (u32)atoi(env);
+    if (val >= 1) afl->dir_execs_per_combo = val;
+  }
+
+  afl->twise_dirty = 1;
+
+}
+
+static void ensure_mutator_buffers(afl_state_t* afl) {
+
+  u32 i;
+
+  if (!afl->mi_record_cap) afl->mi_record_cap = MUTATOR_MI_RECORD_DEFAULT;
+  if (!afl->mi_current_offsets)
+    afl->mi_current_offsets = ck_alloc(sizeof(u32) * afl->mi_record_cap);
+
+  if (afl->mi_max_len && !afl->mi_mut_cnt) {
+
+    afl->mi_mut_cnt = ck_alloc(sizeof(u32) * afl->mi_max_len);
+    afl->mi_hit_cnt = ck_alloc(sizeof(u32) * afl->mi_max_len);
+    afl->mi_weight  = ck_alloc(sizeof(double) * afl->mi_max_len);
+
+    memset(afl->mi_mut_cnt, 0, sizeof(u32) * afl->mi_max_len);
+    memset(afl->mi_hit_cnt, 0, sizeof(u32) * afl->mi_max_len);
+
+    for (i = 0; i < afl->mi_max_len; ++i) afl->mi_weight[i] = 1.0;
+    afl->mi_weight_total = (double)afl->mi_max_len;
+
+  } else if (afl->mi_weight && afl->mi_max_len) {
+
+    afl->mi_weight_total = 0.0;
+    for (i = 0; i < afl->mi_max_len; ++i) afl->mi_weight_total += afl->mi_weight[i];
+
+  }
+
+  if (!afl->twise_positions && afl->twise_max_positions)
+    afl->twise_positions = ck_alloc(sizeof(u32) * afl->twise_max_positions);
+
+  if (!afl->twise_importance && afl->mi_max_len)
+    afl->twise_importance = ck_alloc(sizeof(u32) * afl->mi_max_len);
+
+  if (!afl->twise_templates && afl->twise_max_positions && afl->twise_max_templates)
+    afl->twise_templates = ck_alloc(sizeof(u8) * afl->twise_max_positions * afl->twise_max_templates);
+
+  if (!afl->bandit_arms && afl->bandit_max_arms)
+    afl->bandit_arms = ck_alloc(sizeof(bandit_arm_t) * afl->bandit_max_arms);
+
+  if (!afl->bandit_op_history && afl->bandit_op_cap)
+    afl->bandit_op_history = ck_alloc(sizeof(u32) * afl->bandit_op_cap);
+
+  if (!afl->dir_entry_len && afl->dir_dict_size)
+    afl->dir_entry_len = ck_alloc(sizeof(u32) * afl->dir_dict_size);
+
+  if (!afl->dir_entry_pos && afl->dir_dict_size && afl->dir_max_diff)
+    afl->dir_entry_pos =
+        ck_alloc(sizeof(u32) * (size_t)afl->dir_dict_size * afl->dir_max_diff);
+
+  if (!afl->dir_entry_val && afl->dir_dict_size && afl->dir_max_diff)
+    afl->dir_entry_val =
+        ck_alloc(sizeof(u8) * (size_t)afl->dir_dict_size * afl->dir_max_diff);
+
+  if (!afl->dir_temp_positions && afl->dir_max_diff)
+    afl->dir_temp_positions = ck_alloc(sizeof(u32) * afl->dir_max_diff);
+
+  if (!afl->dir_temp_values && afl->dir_max_diff)
+    afl->dir_temp_values = ck_alloc(sizeof(u8) * afl->dir_max_diff);
+
+  if (!afl->dir_combo_cache && afl->dir_max_combine)
+    afl->dir_combo_cache = ck_alloc(sizeof(u32) * afl->dir_max_combine);
+
+}
 
 static u8  stage_val_type;            /* Value type (STAGE_VAL_*)         */
 
@@ -5524,6 +5805,738 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 }
 
 
+static inline void mutator_record_offset(afl_state_t* afl, u32 pos) {
+
+  if (!afl->collect_offsets || !afl->mi_current_offsets) return;
+  if (afl->mi_current_count >= afl->mi_record_cap) return;
+
+  u32 i;
+  for (i = 0; i < afl->mi_current_count; ++i)
+    if (afl->mi_current_offsets[i] == pos) return;
+
+  afl->mi_current_offsets[afl->mi_current_count++] = pos;
+
+}
+
+static inline void mutator_record_operator(afl_state_t* afl, u32 op) {
+
+  if (!(afl->mutator_modes & MUT_MODE_BANDIT) || !afl->bandit_op_history)
+    return;
+
+  if (afl->bandit_op_count >= afl->bandit_op_cap) return;
+
+  afl->bandit_op_history[afl->bandit_op_count++] = op;
+
+}
+
+static inline void mutator_set_directional_base(afl_state_t* afl,
+                                                const u8* base, u32 len) {
+
+  if (!(afl->mutator_modes & MUT_MODE_DIR)) return;
+
+  afl->dir_base_ptr = base;
+  afl->dir_base_len = len;
+
+}
+
+static inline void mutator_set_directional_candidate(afl_state_t* afl,
+                                                     u8* buf, u32 len) {
+
+  if (!(afl->mutator_modes & MUT_MODE_DIR)) return;
+
+  afl->dir_candidate_ptr = buf;
+  afl->dir_candidate_len = len;
+
+}
+
+static void mutator_iteration_begin(afl_state_t* afl, u32 active_len) {
+
+  (void)active_len;
+
+  afl->iteration_prev_total = queued_paths + unique_crashes;
+
+  if (afl->mutator_modes & (MUT_MODE_MI | MUT_MODE_TWISE)) {
+    afl->collect_offsets   = 1;
+    afl->mi_current_count  = 0;
+  } else {
+    afl->collect_offsets = 0;
+  }
+
+  if (afl->mutator_modes & MUT_MODE_BANDIT) afl->bandit_op_count = 0;
+
+  if (afl->mutator_modes & MUT_MODE_DIR) {
+    afl->dir_collect       = 1;
+    afl->dir_candidate_ptr = NULL;
+    afl->dir_candidate_len = active_len;
+  } else {
+    afl->dir_collect = 0;
+  }
+
+}
+
+static void mutator_iteration_end(afl_state_t* afl, u64 total_progress) {
+
+  u8  success = (total_progress > afl->iteration_prev_total);
+  u32 i;
+
+  if ((afl->mutator_modes & MUT_MODE_DIR) && afl->dir_collect && success &&
+      afl->dir_base_ptr && afl->dir_candidate_ptr && afl->dir_entry_len &&
+      afl->dir_entry_pos && afl->dir_entry_val && afl->dir_temp_positions &&
+      afl->dir_temp_values && afl->dir_dict_size && afl->dir_max_diff) {
+
+    if (afl->dir_candidate_len == afl->dir_base_len && afl->dir_base_len) {
+
+      u32 diff_cnt = 0;
+      for (u32 idx = 0; idx < afl->dir_base_len; ++idx) {
+
+        if (afl->dir_base_ptr[idx] == afl->dir_candidate_ptr[idx]) continue;
+
+        if (diff_cnt >= afl->dir_max_diff) {
+          diff_cnt = afl->dir_max_diff + 1;
+          break;
+        }
+
+        afl->dir_temp_positions[diff_cnt] = idx;
+        afl->dir_temp_values[diff_cnt]    = afl->dir_candidate_ptr[idx];
+        diff_cnt++;
+
+      }
+
+      if (diff_cnt && diff_cnt <= afl->dir_max_diff) {
+
+        u32 slot = afl->dir_dict_next;
+        if (slot >= afl->dir_dict_size) slot = 0;
+
+        u32 *pos_slot = afl->dir_entry_pos +
+                        (size_t)slot * afl->dir_max_diff;
+        u8 *val_slot  = afl->dir_entry_val +
+                       (size_t)slot * afl->dir_max_diff;
+
+        memcpy(pos_slot, afl->dir_temp_positions, sizeof(u32) * diff_cnt);
+        memcpy(val_slot, afl->dir_temp_values, diff_cnt * sizeof(u8));
+
+        afl->dir_entry_len[slot] = diff_cnt;
+
+        if (afl->dir_dict_count < afl->dir_dict_size) afl->dir_dict_count++;
+
+        slot++;
+        if (slot >= afl->dir_dict_size) slot = 0;
+        afl->dir_dict_next = slot;
+
+      }
+
+    }
+
+  }
+
+  if (afl->collect_offsets && afl->mi_current_offsets) {
+
+    for (i = 0; i < afl->mi_current_count; ++i) {
+
+      u32 off = afl->mi_current_offsets[i];
+      if (off >= afl->mi_max_len) continue;
+
+      if ((afl->mutator_modes & MUT_MODE_MI) && afl->mi_mut_cnt && afl->mi_weight) {
+
+        double old_weight = afl->mi_weight[off];
+
+        afl->mi_mut_cnt[off]++;
+        if (success) afl->mi_hit_cnt[off]++;
+
+        double new_weight =
+            (afl->mi_hit_cnt[off] + afl->mi_base_hit) /
+            (afl->mi_mut_cnt[off] + afl->mi_base_mut);
+
+        if (new_weight <= 0.0) new_weight = 1e-6;
+        afl->mi_weight_total += new_weight - old_weight;
+        afl->mi_weight[off] = new_weight;
+
+      }
+
+      if ((afl->mutator_modes & MUT_MODE_TWISE) && success && afl->twise_importance)
+        afl->twise_importance[off]++, afl->twise_dirty = 1;
+
+    }
+
+  }
+
+  afl->collect_offsets  = 0;
+  afl->mi_current_count = 0;
+
+  afl->dir_collect       = 0;
+  afl->dir_candidate_ptr = NULL;
+  afl->dir_candidate_len = 0;
+
+  if ((afl->mutator_modes & MUT_MODE_BANDIT) && afl->bandit_arms) {
+
+    for (i = 0; i < afl->bandit_op_count; ++i) {
+
+      u32          op  = afl->bandit_op_history[i];
+      bandit_arm_t *arm;
+
+      if (op >= afl->bandit_max_arms) continue;
+
+      arm = &afl->bandit_arms[op];
+      arm->pulls++;
+      if (success) arm->rewards++;
+      if (arm->pulls)
+        arm->value = (double)arm->rewards / (double)arm->pulls;
+      afl->bandit_total_pulls++;
+
+    }
+
+    afl->bandit_op_count = 0;
+
+  }
+
+  afl->iteration_prev_total = total_progress;
+
+}
+
+static void twise_refresh_structures(afl_state_t* afl, u32 len) {
+
+  if (!(afl->mutator_modes & MUT_MODE_TWISE)) return;
+  if (!afl->twise_positions || !afl->twise_templates || !afl->twise_max_positions)
+    return;
+
+  if (!afl->twise_importance) return;
+
+  if (!afl->twise_dirty && afl->twise_last_len == len && afl->twise_templates_cnt)
+    return;
+
+  afl->twise_last_len = len;
+  afl->twise_pos_cnt  = 0;
+
+  u32 limit = len;
+  if (limit > afl->mi_max_len) limit = afl->mi_max_len;
+
+  if (!limit) {
+    afl->twise_templates_cnt = 0;
+    afl->twise_dirty         = 0;
+    return;
+  }
+
+  u32 i, j;
+
+  for (i = 0; i < afl->twise_max_positions; ++i) {
+
+    u32 best_idx   = limit;
+    u32 best_score = 0;
+
+    for (j = 0; j < limit; ++j) {
+
+      u8 used = 0;
+      u32 k;
+      for (k = 0; k < afl->twise_pos_cnt; ++k)
+        if (afl->twise_positions[k] == j) { used = 1; break; }
+      if (used) continue;
+
+      u32 score = afl->twise_importance[j];
+      if (score > best_score || (score == best_score && best_idx == limit)) {
+        best_score = score;
+        best_idx   = j;
+      }
+
+    }
+
+    if (best_idx == limit) {
+      if (afl->twise_pos_cnt < afl->twise_strength && afl->twise_pos_cnt < limit)
+        best_idx = afl->twise_pos_cnt;
+      else
+        break;
+    }
+
+    afl->twise_positions[afl->twise_pos_cnt++] = best_idx;
+
+    if (afl->twise_pos_cnt >= afl->twise_strength && best_score == 0)
+      break;
+
+  }
+
+  if (afl->twise_pos_cnt < afl->twise_strength) {
+    afl->twise_templates_cnt = 0;
+    afl->twise_dirty         = 0;
+    return;
+  }
+
+  afl->twise_templates_cnt = 0;
+
+  u32 group_start = 0;
+  while (group_start < afl->twise_pos_cnt &&
+         afl->twise_templates_cnt < afl->twise_max_templates) {
+
+    u32 group_width = afl->twise_strength;
+    if (group_width > afl->twise_pos_cnt - group_start)
+      group_width = afl->twise_pos_cnt - group_start;
+
+    u32 pattern_limit = 1U << group_width;
+    if (pattern_limit > 64U) pattern_limit = 64U;
+
+    u32 pattern;
+    for (pattern = 0; pattern < pattern_limit &&
+                        afl->twise_templates_cnt < afl->twise_max_templates;
+         ++pattern) {
+
+      u8* tpl = afl->twise_templates +
+                (afl->twise_templates_cnt * afl->twise_max_positions);
+
+      memset(tpl, TWISE_CAT_NORMAL, afl->twise_max_positions);
+
+      for (j = 0; j < group_width; ++j) {
+        u32 pos_idx = group_start + j;
+        if (pos_idx >= afl->twise_pos_cnt) break;
+        tpl[pos_idx] = (pattern & (1U << j)) ? TWISE_CAT_BOUNDARY : TWISE_CAT_RANDOM;
+      }
+
+      afl->twise_templates_cnt++;
+
+    }
+
+    group_start += group_width;
+
+  }
+
+  if (!afl->twise_templates_cnt) {
+
+    u8* tpl = afl->twise_templates;
+    memset(tpl, TWISE_CAT_NORMAL, afl->twise_max_positions);
+
+    for (i = 0; i < afl->twise_strength && i < afl->twise_pos_cnt; ++i)
+      tpl[i] = (i & 1) ? TWISE_CAT_BOUNDARY : TWISE_CAT_RANDOM;
+
+    afl->twise_templates_cnt = 1;
+
+  }
+
+  afl->twise_dirty = 0;
+
+}
+
+static s32 compute_local_score(afl_state_t* afl, struct queue_entry* q,
+                               u8* buf, u32 len, u64 progress_before) {
+
+  (void)afl;
+  (void)q;
+  (void)buf;
+  (void)len;
+
+  u64 progress_after = queued_paths + unique_crashes;
+  s32 score          = (s32)count_bytes(trace_bits);
+
+  if (progress_after > progress_before)
+    score += (s32)((progress_after - progress_before) * MAP_SIZE);
+
+  return score;
+
+}
+
+static void sa_apply_local_mutation(afl_state_t* afl, u8* buf, u32 len) {
+
+  if (!len) return;
+
+  u32 op = mutator_choose_operator(afl, 4);
+
+  switch (op) {
+
+    case 0: {
+      u32 bit_pos = mutator_choose_offset(afl, len) << 3;
+      FLIP_BIT(buf, bit_pos);
+      break;
+    }
+
+    case 1: {
+      u32 pos = mutator_choose_offset(afl, len);
+      buf[pos] = interesting_8[UR(sizeof(interesting_8))];
+      break;
+    }
+
+    case 2: {
+      u32 pos = mutator_choose_offset(afl, len);
+      buf[pos] = UR(256);
+      break;
+    }
+
+    case 3: {
+      if (len > 1) {
+        u32 pos1 = mutator_choose_offset(afl, len);
+        u32 pos2 = mutator_choose_offset(afl, len);
+        if (pos1 != pos2) {
+          u8 tmp   = buf[pos1];
+          buf[pos1] = buf[pos2];
+          buf[pos2] = tmp;
+          break;
+        }
+      }
+      buf[mutator_choose_offset(afl, len)] ^= 0xFF;
+      break;
+    }
+
+  }
+
+}
+
+static u32 choose_levy_stack_depth(afl_state_t* afl) {
+
+  (void)afl;
+
+  const double alpha = 1.5;
+  const u32    min_depth = 1;
+  const u32    max_depth = 1 << (HAVOC_STACK_POW2 + 1);
+  double       u, range_min, range_max, sample;
+  u32          depth;
+
+  u = ((double)random() + 1.0) / ((double)RAND_MAX + 2.0);
+  range_min = pow((double)min_depth, 1.0 - alpha);
+  range_max = pow((double)(max_depth + 1), 1.0 - alpha);
+  sample = pow(range_min + (range_max - range_min) * u, 1.0 / (1.0 - alpha));
+  depth = (u32)sample;
+
+  if (depth < min_depth) depth = min_depth;
+  if (depth > max_depth) depth = max_depth;
+
+  return depth ? depth : min_depth;
+
+}
+
+static u32 choose_mi_guided_offset(afl_state_t* afl, u32 limit) {
+
+  if (!limit) return 0;
+  if (!afl->mi_weight || !afl->mi_max_len) return UR(limit);
+
+  if (limit > afl->mi_max_len) limit = afl->mi_max_len;
+
+  double total = 0.0;
+  for (u32 i = 0; i < limit; ++i) total += afl->mi_weight[i];
+
+  if (total <= 0.0) return UR(limit);
+
+  double r = ((double)random() / ((double)RAND_MAX + 1.0)) * total;
+  double acc = 0.0;
+
+  for (u32 i = 0; i < limit; ++i) {
+    acc += afl->mi_weight[i];
+    if (acc >= r) return i;
+  }
+
+  return limit - 1;
+
+}
+
+static u32 choose_mutator_bandit(afl_state_t* afl, u32 max_ops) {
+
+  if (!max_ops) return 0;
+  if (!afl->bandit_arms) return UR(max_ops);
+
+  if (max_ops > afl->bandit_max_arms) {
+
+    afl->bandit_arms = ck_realloc(afl->bandit_arms, sizeof(bandit_arm_t) * max_ops);
+    memset(afl->bandit_arms + afl->bandit_max_arms, 0,
+           sizeof(bandit_arm_t) * (max_ops - afl->bandit_max_arms));
+    afl->bandit_max_arms = max_ops;
+
+  }
+
+  for (u32 i = 0; i < max_ops; ++i)
+    if (!afl->bandit_arms[i].pulls) return i;
+
+  double log_total = log((double)(afl->bandit_total_pulls + 1));
+  double best_score = -1e9;
+  u32    best_op    = 0;
+
+  for (u32 i = 0; i < max_ops; ++i) {
+
+    bandit_arm_t* arm = &afl->bandit_arms[i];
+    double explore = sqrt(log_total / (double)arm->pulls);
+    double score   = arm->value + afl->bandit_explore * explore;
+
+    if (score > best_score) {
+      best_score = score;
+      best_op    = i;
+    }
+
+  }
+
+  return best_op;
+
+}
+
+static inline u32 mutator_choose_offset(afl_state_t* afl, u32 limit) {
+
+  if (!limit) return 0;
+
+  u32 choice;
+
+  if ((afl->mutator_modes & MUT_MODE_MI) && afl->mi_weight)
+    choice = choose_mi_guided_offset(afl, limit);
+  else
+    choice = UR(limit);
+
+  mutator_record_offset(afl, choice);
+  return choice;
+
+}
+
+static inline u32 mutator_choose_operator(afl_state_t* afl, u32 max_ops) {
+
+  if (!max_ops) return 0;
+
+  u32 choice;
+
+  if ((afl->mutator_modes & MUT_MODE_BANDIT) && afl->bandit_arms)
+    choice = choose_mutator_bandit(afl, max_ops);
+  else
+    choice = UR(max_ops);
+
+  mutator_record_operator(afl, choice);
+  return choice;
+
+}
+
+static u8 sa_mutate_stage(afl_state_t* afl, struct queue_entry* q, char** argv,
+                          u8* seed_buf, u32 len) {
+
+  (void)q;
+
+  if (!seed_buf || !len || !afl->sa_steps) return 0;
+
+  u8* current  = ck_alloc_nozero(len);
+  u8* proposal = ck_alloc_nozero(len);
+
+  memcpy(current, seed_buf, len);
+
+  mutator_set_directional_base(afl, seed_buf, len);
+  mutator_iteration_begin(afl, len);
+  mutator_set_directional_candidate(afl, current, len);
+  u64 base_before = queued_paths + unique_crashes;
+  u8  ret         = common_fuzz_stuff(argv, current, len);
+  u64 base_after  = queued_paths + unique_crashes;
+  mutator_iteration_end(afl, base_after);
+  if (ret) {
+    ck_free(proposal);
+    ck_free(current);
+    return ret;
+  }
+
+  s32 current_score = compute_local_score(afl, q, current, len, base_before);
+
+  for (u32 step = 0; step < afl->sa_steps; ++step) {
+
+    double temp = afl->sa_T0 * pow(afl->sa_decay, (double)afl->sa_iteration_count);
+    if (temp < afl->sa_Tmin) temp = afl->sa_Tmin;
+    afl->sa_iteration_count++;
+
+    memcpy(proposal, current, len);
+
+    mutator_set_directional_base(afl, seed_buf, len);
+    mutator_iteration_begin(afl, len);
+
+    u32 min_stack = afl->sa_min_stack ? afl->sa_min_stack : 1;
+    u32 max_stack = afl->sa_max_stack ? afl->sa_max_stack : min_stack;
+    if (max_stack < min_stack) max_stack = min_stack;
+
+    u32 stack = min_stack;
+    if (max_stack > min_stack)
+      stack += UR(max_stack - min_stack + 1);
+
+    for (u32 i = 0; i < stack; ++i) sa_apply_local_mutation(afl, proposal, len);
+
+    for (u32 j = 0; j < afl->sa_noise_ops; ++j)
+      if (UR(100) < 30) sa_apply_local_mutation(afl, proposal, len);
+
+    mutator_set_directional_candidate(afl, proposal, len);
+    u64 before = queued_paths + unique_crashes;
+    ret        = common_fuzz_stuff(argv, proposal, len);
+    u64 after  = queued_paths + unique_crashes;
+    mutator_iteration_end(afl, after);
+
+    if (ret) {
+      ck_free(proposal);
+      ck_free(current);
+      return ret;
+    }
+
+    s32 candidate_score = compute_local_score(afl, q, proposal, len, before);
+    s32 delta           = candidate_score - current_score;
+
+    if (delta >= 0) {
+      memcpy(current, proposal, len);
+      current_score = candidate_score;
+    } else {
+      double accept_prob = exp((double)delta / temp);
+      double roll        = ((double)random()) / ((double)RAND_MAX + 1.0);
+      if (roll < accept_prob) {
+        memcpy(current, proposal, len);
+        current_score = candidate_score;
+      }
+    }
+
+  }
+
+  ck_free(proposal);
+  ck_free(current);
+  return 0;
+
+}
+
+static u8 perform_directional_mutation(afl_state_t* afl, struct queue_entry* q,
+                                       char** argv, u8* seed_buf, u32 len) {
+
+  (void)q;
+
+  if (!(afl->mutator_modes & MUT_MODE_DIR) || !seed_buf || !len) return 0;
+
+  if (!afl->dir_entry_len || !afl->dir_entry_pos || !afl->dir_entry_val ||
+      !afl->dir_combo_cache || !afl->dir_dict_count || !afl->dir_max_diff)
+    return 0;
+
+  u32 attempts = afl->dir_execs_per_combo ? afl->dir_execs_per_combo : 1;
+
+  u8* work_buf = ck_alloc_nozero(len);
+
+  for (u32 attempt = 0; attempt < attempts; ++attempt) {
+
+    if (!afl->dir_dict_count) break;
+
+    u32 available = afl->dir_dict_count;
+    u32 limit     = afl->dir_max_combine ? afl->dir_max_combine : 1;
+    if (limit > available) limit = available;
+    if (!limit) break;
+
+    memcpy(work_buf, seed_buf, len);
+
+    mutator_set_directional_base(afl, seed_buf, len);
+    mutator_iteration_begin(afl, len);
+
+    u32 combo_cnt = 1 + UR(limit);
+    if (combo_cnt > available) combo_cnt = available;
+
+    u32 chosen = 0;
+    while (chosen < combo_cnt) {
+
+      u32 pick = UR(available);
+      u8  dup  = 0;
+
+      for (u32 i = 0; i < chosen; ++i)
+        if (afl->dir_combo_cache[i] == pick) { dup = 1; break; }
+
+      if (dup) continue;
+
+      afl->dir_combo_cache[chosen++] = pick;
+
+    }
+
+    for (u32 c = 0; c < chosen; ++c) {
+
+      u32 idx = afl->dir_combo_cache[c];
+      if (idx >= afl->dir_dict_size) idx %= afl->dir_dict_size;
+      if (idx >= afl->dir_dict_count) continue;
+
+      u32 entry_len = afl->dir_entry_len[idx];
+      if (!entry_len) continue;
+
+      u32* pos_slot = afl->dir_entry_pos + (size_t)idx * afl->dir_max_diff;
+      u8*  val_slot = afl->dir_entry_val + (size_t)idx * afl->dir_max_diff;
+
+      for (u32 d = 0; d < entry_len; ++d) {
+        u32 pos = pos_slot[d];
+        if (pos >= len) continue;
+        work_buf[pos] = val_slot[d];
+        mutator_record_offset(afl, pos);
+      }
+
+    }
+
+    if (len && UR(100) < 15) {
+      u32 noise_pos = mutator_choose_offset(afl, len);
+      work_buf[noise_pos] ^= 1 << UR(8);
+    }
+
+    mutator_set_directional_candidate(afl, work_buf, len);
+    u64 before = queued_paths + unique_crashes;
+    u8  ret    = common_fuzz_stuff(argv, work_buf, len);
+    u64 after  = queued_paths + unique_crashes;
+    mutator_iteration_end(afl, after);
+
+    if (ret) {
+      ck_free(work_buf);
+      return ret;
+    }
+
+  }
+
+  ck_free(work_buf);
+  return 0;
+
+}
+
+static u8 perform_twise_mutation(afl_state_t* afl, struct queue_entry* q,
+                                 char** argv, u8* seed_buf, u32 len) {
+
+  (void)q;
+
+  if (!(afl->mutator_modes & MUT_MODE_TWISE) || !seed_buf || !len)
+    return 0;
+
+  twise_refresh_structures(afl, len);
+
+  if (!afl->twise_templates_cnt || afl->twise_pos_cnt < afl->twise_strength)
+    return 0;
+
+  u8* work_buf = ck_alloc_nozero(len);
+
+  mutator_set_directional_base(afl, seed_buf, len);
+  for (u32 t = 0; t < afl->twise_templates_cnt; ++t) {
+
+    for (u32 rep = 0; rep < afl->twise_execs_per_template; ++rep) {
+
+      memcpy(work_buf, seed_buf, len);
+      mutator_set_directional_base(afl, seed_buf, len);
+      mutator_iteration_begin(afl, len);
+
+      u8* tpl = afl->twise_templates + t * afl->twise_max_positions;
+
+      for (u32 i = 0; i < afl->twise_pos_cnt; ++i) {
+
+        u32 pos = afl->twise_positions[i];
+        if (pos >= len) continue;
+
+        switch (tpl[i]) {
+          case TWISE_CAT_BOUNDARY:
+            mutator_record_offset(afl, pos);
+            work_buf[pos] = interesting_8[UR(sizeof(interesting_8))];
+            break;
+          case TWISE_CAT_RANDOM:
+            mutator_record_offset(afl, pos);
+            work_buf[pos] = UR(256);
+            break;
+          default:
+            break;
+        }
+
+      }
+
+      if (len > 1 && UR(100) < 25) sa_apply_local_mutation(afl, work_buf, len);
+
+      mutator_set_directional_candidate(afl, work_buf, len);
+      u64 before = queued_paths + unique_crashes;
+      u8  ret    = common_fuzz_stuff(argv, work_buf, len);
+      u64 after  = queued_paths + unique_crashes;
+      mutator_iteration_end(afl, after);
+
+      if (ret) {
+        ck_free(work_buf);
+        return ret;
+      }
+
+    }
+
+  }
+
+  ck_free(work_buf);
+  return 0;
+
+}
+
 /* Helper to choose random block len for block operations in fuzz_one().
    Doesn't return zero, provided that max_len is > 0. */
 
@@ -6984,6 +7997,10 @@ skip_extras:
 
 havoc_stage:
 
+  if (mutator_state.mutator_modes & MUT_MODE_SA)
+    if (sa_mutate_stage(&mutator_state, queue_cur, argv, in_buf, len))
+      goto abandon_entry;
+
   stage_cur_byte = -1;
 
   /* The havoc stage mutation code is also invoked when splicing files; if the
@@ -7022,13 +8039,24 @@ havoc_stage:
 
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
 
-    u32 use_stacking = 1 << (1 + UR(HAVOC_STACK_POW2));
+    u32 use_stacking;
+
+    mutator_set_directional_base(&mutator_state, in_buf, len);
+    mutator_iteration_begin(&mutator_state, temp_len);
+
+    if (mutator_state.mutator_modes & MUT_MODE_LEVY)
+      use_stacking = choose_levy_stack_depth(&mutator_state);
+    else
+      use_stacking = 1 << (1 + UR(HAVOC_STACK_POW2));
 
     stage_cur_val = use_stacking;
 
     for (i = 0; i < use_stacking; i++) {
 
-      switch (UR(15 + 2 + (region_level_mutation ? 4 : 0))) {
+      u32 mutator_max = 15 + 2 + (region_level_mutation ? 4 : 0);
+      u32 mutator_sel = mutator_choose_operator(&mutator_state, mutator_max);
+
+      switch (mutator_sel) {
 
         case 0:
 
@@ -7041,7 +8069,8 @@ havoc_stage:
 
           /* Set byte to interesting value. */
 
-          out_buf[UR(temp_len)] = interesting_8[UR(sizeof(interesting_8))];
+          out_buf[mutator_choose_offset(&mutator_state, temp_len)] =
+              interesting_8[UR(sizeof(interesting_8))];
           break;
 
         case 2:
@@ -7052,12 +8081,12 @@ havoc_stage:
 
           if (UR(2)) {
 
-            *(u16*)(out_buf + UR(temp_len - 1)) =
+            *(u16*)(out_buf + mutator_choose_offset(&mutator_state, temp_len - 1)) =
               interesting_16[UR(sizeof(interesting_16) >> 1)];
 
           } else {
 
-            *(u16*)(out_buf + UR(temp_len - 1)) = SWAP16(
+            *(u16*)(out_buf + mutator_choose_offset(&mutator_state, temp_len - 1)) = SWAP16(
               interesting_16[UR(sizeof(interesting_16) >> 1)]);
 
           }
@@ -7072,12 +8101,12 @@ havoc_stage:
 
           if (UR(2)) {
 
-            *(u32*)(out_buf + UR(temp_len - 3)) =
+            *(u32*)(out_buf + mutator_choose_offset(&mutator_state, temp_len - 3)) =
               interesting_32[UR(sizeof(interesting_32) >> 2)];
 
           } else {
 
-            *(u32*)(out_buf + UR(temp_len - 3)) = SWAP32(
+            *(u32*)(out_buf + mutator_choose_offset(&mutator_state, temp_len - 3)) = SWAP32(
               interesting_32[UR(sizeof(interesting_32) >> 2)]);
 
           }
@@ -7088,14 +8117,16 @@ havoc_stage:
 
           /* Randomly subtract from byte. */
 
-          out_buf[UR(temp_len)] -= 1 + UR(ARITH_MAX);
+          out_buf[mutator_choose_offset(&mutator_state, temp_len)] -=
+              1 + UR(ARITH_MAX);
           break;
 
         case 5:
 
           /* Randomly add to byte. */
 
-          out_buf[UR(temp_len)] += 1 + UR(ARITH_MAX);
+          out_buf[mutator_choose_offset(&mutator_state, temp_len)] +=
+              1 + UR(ARITH_MAX);
           break;
 
         case 6:
@@ -7106,13 +8137,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = UR(temp_len - 1);
+            u32 pos = mutator_choose_offset(&mutator_state, temp_len - 1);
 
             *(u16*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = UR(temp_len - 1);
+            u32 pos = mutator_choose_offset(&mutator_state, temp_len - 1);
             u16 num = 1 + UR(ARITH_MAX);
 
             *(u16*)(out_buf + pos) =
@@ -7130,13 +8161,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = UR(temp_len - 1);
+            u32 pos = mutator_choose_offset(&mutator_state, temp_len - 1);
 
             *(u16*)(out_buf + pos) += 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = UR(temp_len - 1);
+            u32 pos = mutator_choose_offset(&mutator_state, temp_len - 1);
             u16 num = 1 + UR(ARITH_MAX);
 
             *(u16*)(out_buf + pos) =
@@ -7154,13 +8185,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = UR(temp_len - 3);
+            u32 pos = mutator_choose_offset(&mutator_state, temp_len - 3);
 
             *(u32*)(out_buf + pos) -= 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = UR(temp_len - 3);
+            u32 pos = mutator_choose_offset(&mutator_state, temp_len - 3);
             u32 num = 1 + UR(ARITH_MAX);
 
             *(u32*)(out_buf + pos) =
@@ -7178,13 +8209,13 @@ havoc_stage:
 
           if (UR(2)) {
 
-            u32 pos = UR(temp_len - 3);
+            u32 pos = mutator_choose_offset(&mutator_state, temp_len - 3);
 
             *(u32*)(out_buf + pos) += 1 + UR(ARITH_MAX);
 
           } else {
 
-            u32 pos = UR(temp_len - 3);
+            u32 pos = mutator_choose_offset(&mutator_state, temp_len - 3);
             u32 num = 1 + UR(ARITH_MAX);
 
             *(u32*)(out_buf + pos) =
@@ -7200,7 +8231,7 @@ havoc_stage:
              why not. We use XOR with 1-255 to eliminate the
              possibility of a no-op. */
 
-          out_buf[UR(temp_len)] ^= 1 + UR(255);
+          out_buf[mutator_choose_offset(&mutator_state, temp_len)] ^= 1 + UR(255);
           break;
 
         case 11 ... 12: {
@@ -7217,7 +8248,7 @@ havoc_stage:
 
             del_len = choose_block_len(temp_len - 1);
 
-            del_from = UR(temp_len - del_len + 1);
+            del_from = mutator_choose_offset(&mutator_state, temp_len - del_len + 1);
 
             memmove(out_buf + del_from, out_buf + del_from + del_len,
                     temp_len - del_from - del_len);
@@ -7241,7 +8272,8 @@ havoc_stage:
             if (actually_clone) {
 
               clone_len  = choose_block_len(temp_len);
-              clone_from = UR(temp_len - clone_len + 1);
+              clone_from = mutator_choose_offset(&mutator_state,
+                                                 temp_len - clone_len + 1);
 
             } else {
 
@@ -7250,7 +8282,7 @@ havoc_stage:
 
             }
 
-            clone_to   = UR(temp_len);
+            clone_to   = mutator_choose_offset(&mutator_state, temp_len);
 
             new_buf = ck_alloc_nozero(temp_len + clone_len);
 
@@ -7264,7 +8296,9 @@ havoc_stage:
               memcpy(new_buf + clone_to, out_buf + clone_from, clone_len);
             else
               memset(new_buf + clone_to,
-                     UR(2) ? UR(256) : out_buf[UR(temp_len)], clone_len);
+                     UR(2) ? UR(256)
+                           : out_buf[mutator_choose_offset(&mutator_state, temp_len)],
+                     clone_len);
 
             /* Tail */
             memcpy(new_buf + clone_to + clone_len, out_buf + clone_to,
@@ -7289,8 +8323,8 @@ havoc_stage:
 
             copy_len  = choose_block_len(temp_len - 1);
 
-            copy_from = UR(temp_len - copy_len + 1);
-            copy_to   = UR(temp_len - copy_len + 1);
+            copy_from = mutator_choose_offset(&mutator_state, temp_len - copy_len + 1);
+            copy_to   = mutator_choose_offset(&mutator_state, temp_len - copy_len + 1);
 
             if (UR(4)) {
 
@@ -7298,7 +8332,9 @@ havoc_stage:
                 memmove(out_buf + copy_to, out_buf + copy_from, copy_len);
 
             } else memset(out_buf + copy_to,
-                          UR(2) ? UR(256) : out_buf[UR(temp_len)], copy_len);
+                          UR(2) ? UR(256)
+                                : out_buf[mutator_choose_offset(&mutator_state, temp_len)],
+                          copy_len);
 
             break;
 
@@ -7323,7 +8359,7 @@ havoc_stage:
 
               if (extra_len > temp_len) break;
 
-              insert_at = UR(temp_len - extra_len + 1);
+              insert_at = mutator_choose_offset(&mutator_state, temp_len - extra_len + 1);
               memcpy(out_buf + insert_at, a_extras[use_extra].data, extra_len);
 
             } else {
@@ -7336,7 +8372,7 @@ havoc_stage:
 
               if (extra_len > temp_len) break;
 
-              insert_at = UR(temp_len - extra_len + 1);
+              insert_at = mutator_choose_offset(&mutator_state, temp_len - extra_len + 1);
               memcpy(out_buf + insert_at, extras[use_extra].data, extra_len);
 
             }
@@ -7348,7 +8384,8 @@ havoc_stage:
         case 16: {
             if (extras_cnt + a_extras_cnt == 0) break;
 
-            u32 use_extra, extra_len, insert_at = UR(temp_len + 1);
+            u32 use_extra, extra_len, insert_at =
+                mutator_choose_offset(&mutator_state, temp_len + 1);
             u8* new_buf;
 
             /* Insert an extra. Do the same dice-rolling stuff as for the
@@ -7480,7 +8517,12 @@ havoc_stage:
 
     }
 
-    if (common_fuzz_stuff(argv, out_buf, temp_len))
+    mutator_set_directional_candidate(&mutator_state, out_buf, temp_len);
+    u8 havoc_ret = common_fuzz_stuff(argv, out_buf, temp_len);
+    u64 havoc_after = queued_paths + unique_crashes;
+    mutator_iteration_end(&mutator_state, havoc_after);
+
+    if (havoc_ret)
       goto abandon_entry;
 
     /* out_buf might have been mangled a bit, so let's restore it to its
@@ -7607,6 +8649,14 @@ retry_splicing:
   }
 
 #endif /* !IGNORE_FINDS */
+
+  if ((mutator_state.mutator_modes & MUT_MODE_DIR) &&
+      perform_directional_mutation(&mutator_state, queue_cur, argv, in_buf, len))
+    goto abandon_entry;
+
+  if ((mutator_state.mutator_modes & MUT_MODE_TWISE) &&
+      perform_twise_mutation(&mutator_state, queue_cur, argv, in_buf, len))
+    goto abandon_entry;
 
   ret_val = 0;
 
@@ -8095,7 +9145,8 @@ static void usage(u8* argv0) {
 
        "  -d            - quick & dirty mode (skips deterministic steps)\n"
        "  -n            - fuzz without instrumentation (dumb mode)\n"
-       "  -x dir        - optional fuzzer dictionary (see README)\n\n"
+       "  -x dir        - optional fuzzer dictionary (see README)\n"
+       "  -Z mode       - mutation mode selector (default, levy, sa, dir, twise, mi, bandit, use + for combos)\n\n"
 
        "Settings for network protocol fuzzing (AFLNet):\n\n"
 
@@ -8769,6 +9820,87 @@ static void save_cmdline(u32 argc, char** argv) {
 
 }
 
+static void parse_mutator_modes(afl_state_t* afl, const char* mode_str) {
+
+  char* copy;
+  char* token;
+
+  if (!mode_str || !*mode_str) FATAL("Empty mutator mode string supplied to -Z");
+
+  copy = ck_strdup(mode_str);
+
+  if (!strcasecmp(copy, "default") || !strcasecmp(copy, "classic")) {
+
+    afl->mutator_modes = MUT_MODE_DEFAULT;
+    ck_free(copy);
+    return;
+
+  }
+
+  afl->mutator_modes = 0;
+  token = strtok(copy, "+");
+
+  while (token) {
+
+    u8* start = (u8*)token;
+    u8* end;
+
+    while (*start && isspace(*start)) start++;
+    end = start + strlen((char*)start);
+    while (end > start && isspace(*(end - 1))) end--;
+    *end = '\0';
+
+    if (!*start) {
+      token = strtok(NULL, "+");
+      continue;
+    }
+
+    if (!strcasecmp((char*)start, "levy")) {
+      afl->mutator_modes |= MUT_MODE_LEVY;
+    } else if (!strcasecmp((char*)start, "sa")) {
+      afl->mutator_modes |= MUT_MODE_SA;
+    } else if (!strcasecmp((char*)start, "dir")) {
+      afl->mutator_modes |= MUT_MODE_DIR;
+    } else if (!strcasecmp((char*)start, "twise")) {
+      afl->mutator_modes |= MUT_MODE_TWISE;
+    } else if (!strcasecmp((char*)start, "mi")) {
+      afl->mutator_modes |= MUT_MODE_MI;
+    } else if (!strcasecmp((char*)start, "bandit")) {
+      afl->mutator_modes |= MUT_MODE_BANDIT;
+    } else {
+
+      FATAL("Unknown mutator mode '%s' (valid: default, classic, levy, sa, dir, twise, mi, bandit)",
+            start);
+
+    }
+
+    token = strtok(NULL, "+");
+
+  }
+
+  if (!afl->mutator_modes) afl->mutator_modes = MUT_MODE_DEFAULT;
+
+  ck_free(copy);
+
+}
+
+static void maybe_print_mutator_modes(const afl_state_t* afl) {
+
+  if (afl->mutator_modes == MUT_MODE_DEFAULT) {
+    OKF("Using default AFLNet mutation strategy.");
+    return;
+  }
+
+  OKF("Using mutator modes:");
+  if (afl->mutator_modes & MUT_MODE_LEVY)   SAYF("  - Levy-Havoc\n");
+  if (afl->mutator_modes & MUT_MODE_SA)     SAYF("  - SA-Mutate\n");
+  if (afl->mutator_modes & MUT_MODE_DIR)    SAYF("  - Directional Mutation\n");
+  if (afl->mutator_modes & MUT_MODE_TWISE)  SAYF("  - t-wise Mutator\n");
+  if (afl->mutator_modes & MUT_MODE_MI)     SAYF("  - MI-Guided Havoc\n");
+  if (afl->mutator_modes & MUT_MODE_BANDIT) SAYF("  - Bandit-Scheduler\n");
+
+}
+
 /* Check that afl-fuzz (file/process) has some effective and permitted capability */
 
 static int check_ep_capability(cap_value_t cap, const char *filename) {
@@ -8838,7 +9970,9 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:")) > 0)
+  init_mutator_state(&mutator_state);
+
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:Z:")) > 0)
 
     switch (opt) {
 
@@ -8976,6 +10110,13 @@ int main(int argc, char** argv) {
 
         in_bitmap = optarg;
         read_bitmap(in_bitmap);
+        break;
+
+      case 'Z': /* mutator mode selection */
+
+        if (!optarg || !*optarg) FATAL("-Z requires a non-empty mode string");
+        parse_mutator_modes(&mutator_state, optarg);
+        mutator_mode_from_cli = 1;
         break;
 
       case 'C': /* crash mode */
@@ -9160,6 +10301,26 @@ int main(int argc, char** argv) {
     }
 
   if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
+
+  if (!mutator_mode_from_cli) {
+
+    mutator_state.mutator_modes = MUT_MODE_DEFAULT;
+
+    if (getenv("AFL_LEVY_HAVOC")) mutator_state.mutator_modes |= MUT_MODE_LEVY;
+    if (getenv("AFL_SA_MUTATE")) mutator_state.mutator_modes |= MUT_MODE_SA;
+    if (getenv("AFL_DIR_MUTATE")) mutator_state.mutator_modes |= MUT_MODE_DIR;
+    if (getenv("AFL_TWISE_MUTATE")) mutator_state.mutator_modes |= MUT_MODE_TWISE;
+    if (getenv("AFL_MI_HAVOC")) mutator_state.mutator_modes |= MUT_MODE_MI;
+    if (getenv("AFL_BANDIT_MUT")) mutator_state.mutator_modes |= MUT_MODE_BANDIT;
+
+    if (!mutator_state.mutator_modes) mutator_state.mutator_modes = MUT_MODE_DEFAULT;
+
+  }
+
+  configure_mutator_state(&mutator_state);
+  ensure_mutator_buffers(&mutator_state);
+
+  maybe_print_mutator_modes(&mutator_state);
 
   //AFLNet - Check for required arguments
   if (!use_net) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");

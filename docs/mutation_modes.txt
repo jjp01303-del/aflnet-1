@@ -1,0 +1,57 @@
+AFLNet 统一变异模式使用手册
+==========================
+
+概览
+----
+为了在 AFLNet 中统一控制多种高级变异策略，`afl-fuzz` 新增了 `-Z` 选项，并保持了历史参数（如 `-d`）的兼容语义。本文档描述命令行与环境变量的配置方式，以及各个变异模式的含义与组合规则。
+
+快速入门
+--------
+1. 使用原始 AFLNet 行为：
+   ```bash
+   afl-fuzz -i in -o out -P <protocol> -D <ip/port> -Z default
+   ```
+2. 只启用 Lévy-Havoc 与 MI-Guided Havoc：
+   ```bash
+   afl-fuzz ... -Z levy+mi
+   ```
+3. 继续使用旧的环境变量（仅当未传 `-Z` 时生效）：
+   ```bash
+   AFL_MI_HAVOC=1 AFL_BANDIT_MUT=1 afl-fuzz ...
+   ```
+
+命令行选项
+----------
+- `-Z <mode>`：选择启用的变异策略组合。`mode` 由一个或多个子模式组成，子模式之间用 `+` 连接，大小写不敏感。
+  - `default` / `classic`：关闭所有新增策略，仅运行原始 AFLNet 流程。
+  - `levy`：启用 Lévy-Havoc，叠加步数服从截断幂律分布。
+  - `sa`：启用 SA-Mutate 模拟退火阶段。
+  - `dir`：启用 Directional Mutation，复用历史成功差分。
+  - `twise`：启用 t-wise Mutator，对重要字节的组合进行系统覆盖。
+  - `mi`：启用 MI-Guided Havoc，根据敏感度权重挑选偏移。
+  - `bandit`：启用 Bandit-Scheduler，自适应选择变异算子。
+
+  任意子模式都可以组合，例如 `-Z levy+mi+bandit`。如果字符串为空或包含未知子模式，`afl-fuzz` 会报错并终止运行。
+
+- `-d`：跳过确定性（deterministic）阶段，直接进入随机阶段（havoc、splice 等）。在新的统一机制下，`-d` 的作用保持不变——仍然等价于“只用 havoc 流程”。区别在于：当同时启用了 `-Z` 的某些模式时，这些额外阶段会在随机阶段前后执行，因此 `-d` 只控制是否运行旧的确定性步骤，而不会禁止 Lévy、SA、Directional 等新阶段。
+
+环境变量兼容
+------------
+若命令行未指定 `-Z`，程序会读取以下环境变量并为对应策略置位：
+`AFL_LEVY_HAVOC`、`AFL_SA_MUTATE`、`AFL_DIR_MUTATE`、`AFL_TWISE_MUTATE`、`AFL_MI_HAVOC`、`AFL_BANDIT_MUT`。若没有任何变量被设置，则自动回退到 `default` 模式。只要提供了 `-Z` 参数，上述环境变量将被忽略。
+
+运行时提示
+----------
+启动时，`afl-fuzz` 会打印当前启用的模式列表，便于确认配置是否生效。例如：
+```
+[+] Using mutator modes:
+    - Lévy-Havoc
+    - MI-Guided Havoc
+```
+
+常见问题
+--------
+- **如何同时测试多种策略？** 在 `-Z` 中用 `+` 连接多个子模式即可。
+- **想回到原始行为？** 明确传入 `-Z default`，或确保既没有 `-Z` 也没有相关环境变量。
+- **`-d` 是否会关闭新阶段？** 不会。`-d` 仅跳过旧的确定性阶段，新模式是否运行完全由 `-Z` 或环境变量控制。
+
