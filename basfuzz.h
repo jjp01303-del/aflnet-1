@@ -29,7 +29,9 @@ int basfuzz_compute_similarity(struct basfuzz_matrix* m,
 
 void basfuzz_sort_queue(struct queue_entry** queue_array,
                         u32 queue_len,
-                        double* scores);
+                        double* scores,
+                        double* beta,
+                        double* gamma);
 
 void basfuzz_free_matrix(struct basfuzz_matrix* m);
 

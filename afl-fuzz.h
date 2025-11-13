@@ -21,6 +21,7 @@ typedef struct bandit_arm {
 
 typedef struct afl_state {
   u32 mutator_modes;
+  u8  debug;
 
   /* Simulated annealing (SA-Mutate) parameters */
   u32    sa_steps;

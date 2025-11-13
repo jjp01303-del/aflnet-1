@@ -685,6 +685,12 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
   u32                   max_len;
   double                weight;
   u32                   schedule_count;
+  u64                   t_build = 0;
+  u64                   t_sim   = 0;
+  u64                   t_sort  = 0;
+  u8                    debug_logging = afl ? afl->debug : 0;
+  u8                    verbose_logging = !not_on_tty;
+  u8                    log_enabled     = verbose_logging || debug_logging;
 
   matrix.data = NULL;
   matrix.n    = 0;
@@ -720,6 +726,9 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
     if (count > afl->basfuzz_max_seeds) {
       schedule_count = afl->basfuzz_max_seeds;
       skip_gamma     = 1;
+      WARNF("BASFuzz: queue length %u exceeds cap %u, limiting ranking to %u entries%s",
+            count, afl->basfuzz_max_seeds, schedule_count,
+            skip_gamma ? " (skipping gamma term)" : "");
     }
   }
 
@@ -756,6 +765,8 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
 
   }
 
+  u64 t_begin = get_cur_time_us();
+
   if (basfuzz_build_matrix(afl, basfuzz_order, schedule_count, max_len,
                            &matrix)) {
 
@@ -766,10 +777,14 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
 
   }
 
+  t_build = get_cur_time_us() - t_begin;
+
   if (schedule_count) {
     beta = ck_alloc(sizeof(double) * schedule_count);
     if (!skip_gamma) gamma = ck_alloc(sizeof(double) * schedule_count);
   }
+
+  t_begin = get_cur_time_us();
 
   if (schedule_count &&
       basfuzz_compute_similarity(&matrix, weight, beta, gamma,
@@ -781,8 +796,15 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
 
   }
 
+  t_sim = schedule_count ? (get_cur_time_us() - t_begin) : 0;
+
+  t_begin = get_cur_time_us();
+
   if (schedule_count)
-    basfuzz_sort_queue(basfuzz_order, schedule_count, basfuzz_scores);
+    basfuzz_sort_queue(basfuzz_order, schedule_count, basfuzz_scores, beta,
+                       gamma);
+
+  t_sort = schedule_count ? (get_cur_time_us() - t_begin) : 0;
 
   for (u32 i = schedule_count; i < count; ++i) basfuzz_scores[i] = 0.0;
 
@@ -799,6 +821,25 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
 
   basfuzz_head  = basfuzz_order[0];
   basfuzz_dirty = 0;
+
+  if (schedule_count && log_enabled) {
+    u64 build_ms = t_build / 1000ULL;
+    u64 sim_ms   = t_sim / 1000ULL;
+    u64 sort_ms  = t_sort / 1000ULL;
+    ACTF("BASFUZZ: n=%u, d=%u, build=%llu ms, sim=%llu ms, sort=%llu ms",
+         schedule_count, matrix.d, build_ms, sim_ms, sort_ms);
+  }
+
+  if (schedule_count && debug_logging) {
+    u32 inspect = schedule_count < 5 ? schedule_count : 5;
+    for (u32 i = 0; i < inspect; ++i) {
+      struct queue_entry* cur = basfuzz_order[i];
+      double              b   = beta ? beta[i] : 0.0;
+      double              g   = gamma ? gamma[i] : 0.0;
+      SAYF("[BASFUZZ] rank=%u id=%u beta=%.4f gamma=%.4f score=%.4f\n", i,
+           cur ? cur->index : 0, b, g, basfuzz_scores[i]);
+    }
+  }
 
   if (afl) afl->basfuzz_counter = 0;
 
@@ -838,9 +879,10 @@ static struct queue_entry* queue_iteration_next(struct queue_entry* cur) {
 static void maybe_print_basfuzz_settings(void) {
 
   if (basfuzz_enabled)
-    OKF("BASFuzz seed scheduling enabled (h=%.3f, max_len=%u, interval=%u, max_seeds=%u).",
+    OKF("BASFuzz seed scheduling enabled (h=%.3f, max_len=%u, interval=%u, max_seeds=%u, debug=%s).",
         mutator_state.basfuzz_h, mutator_state.basfuzz_max_len,
-        mutator_state.basfuzz_interval, mutator_state.basfuzz_max_seeds);
+        mutator_state.basfuzz_interval, mutator_state.basfuzz_max_seeds,
+        mutator_state.debug ? "on" : "off");
 
 }
 
@@ -10794,6 +10836,15 @@ int main(int argc, char** argv) {
       u32 val = (u32)atoi(env);
       mutator_state.basfuzz_max_seeds = val;
       basfuzz_mark_dirty();
+    }
+
+  }
+
+  {
+
+    char* env = getenv("AFL_BASFUZZ_DEBUG");
+    if (env && env[0] != '-') {
+      mutator_state.debug = atoi(env) ? 1 : 0;
     }
 
   }

@@ -68,7 +68,10 @@ int basfuzz_build_matrix(struct afl_state* afl,
   out->d    = 0;
   out->data = NULL;
 
-  if (!queue_len || !max_len || !queue_array) return 0;
+  if (!queue_array || !queue_len || !max_len) {
+    WARNF("basfuzz: invalid matrix request (n=%u, d=%u)", queue_len, max_len);
+    return -1;
+  }
 
   u64 total = (u64)queue_len * (u64)max_len;
   if (total > UINT32_MAX) {
@@ -77,8 +80,10 @@ int basfuzz_build_matrix(struct afl_state* afl,
   }
 
   out->data = ck_alloc((u32)total);
-  out->n    = queue_len;
-  out->d    = max_len;
+  if (!out->data) return -1;
+
+  out->n = queue_len;
+  out->d = max_len;
 
   for (u32 i = 0; i < queue_len; ++i) {
 
@@ -164,6 +169,10 @@ int basfuzz_compute_similarity(struct basfuzz_matrix* m,
                                double* scores) {
 
   if (!m || !beta || !scores) return -1;
+  if (!m->data || !m->n || !m->d) {
+    WARNF("basfuzz: invalid similarity matrix (n=%u, d=%u)", m->n, m->d);
+    return -1;
+  }
 
   if (h < 0.0 || h > 1.0) h = 0.5;
 
@@ -187,6 +196,8 @@ int basfuzz_compute_similarity(struct basfuzz_matrix* m,
 struct basfuzz_item {
   struct queue_entry* qe;
   double              score;
+  double              beta;
+  double              gamma;
 };
 
 static int basfuzz_item_cmp(const void* a, const void* b) {
@@ -204,7 +215,9 @@ static int basfuzz_item_cmp(const void* a, const void* b) {
 
 void basfuzz_sort_queue(struct queue_entry** queue_array,
                         u32 queue_len,
-                        double* scores) {
+                        double* scores,
+                        double* beta,
+                        double* gamma) {
 
   if (!queue_array || !scores || queue_len < 2) return;
 
@@ -213,6 +226,8 @@ void basfuzz_sort_queue(struct queue_entry** queue_array,
   for (u32 i = 0; i < queue_len; ++i) {
     items[i].qe    = queue_array[i];
     items[i].score = scores[i];
+    items[i].beta  = beta ? beta[i] : 0.0;
+    items[i].gamma = gamma ? gamma[i] : 0.0;
   }
 
   qsort(items, queue_len, sizeof(struct basfuzz_item), basfuzz_item_cmp);
@@ -221,6 +236,8 @@ void basfuzz_sort_queue(struct queue_entry** queue_array,
 
     queue_array[i] = items[i].qe;
     scores[i]      = items[i].score;
+    if (beta) beta[i] = items[i].beta;
+    if (gamma) gamma[i] = items[i].gamma;
 
   }
 
