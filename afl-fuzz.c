@@ -90,6 +90,8 @@
 #define MUTATOR_DIR_DEFAULT_EXEC_ROUNDS    8U
 #define BASFUZZ_DEFAULT_MAX_LEN            10000U
 #define BASFUZZ_DEFAULT_WEIGHT             0.5
+#define BASFUZZ_DEFAULT_INTERVAL           0U
+#define BASFUZZ_DEFAULT_MAX_SEEDS          512U
 
 struct queue_entry;
 
@@ -295,8 +297,12 @@ static void init_mutator_state(afl_state_t* afl) {
   afl->dir_candidate_len       = 0;
   afl->dir_collect             = 0;
 
-  afl->basfuzz_last_cycle     = 0;
-  afl->basfuzz_resched_period = 0;
+  afl->use_basfuzz          = 0;
+  afl->basfuzz_h            = BASFUZZ_DEFAULT_WEIGHT;
+  afl->basfuzz_max_len      = BASFUZZ_DEFAULT_MAX_LEN;
+  afl->basfuzz_interval     = BASFUZZ_DEFAULT_INTERVAL;
+  afl->basfuzz_counter      = 0;
+  afl->basfuzz_max_seeds    = BASFUZZ_DEFAULT_MAX_SEEDS;
 
 }
 
@@ -569,14 +575,14 @@ struct queue_entry {
 
 };
 
-static u8  basfuzz_enabled     = 0;
-static u8  basfuzz_dirty       = 1;
-static u8  basfuzz_cli_enable  = 0;
-static u8  basfuzz_cli_weight  = 0;
-static u8  basfuzz_cli_len     = 0;
+static u8  basfuzz_enabled      = 0;
+static u8  basfuzz_dirty        = 1;
+static u8  basfuzz_cli_enable   = 0;
+static u8  basfuzz_cli_weight   = 0;
+static u8  basfuzz_cli_len      = 0;
+static u8  basfuzz_cli_interval = 0;
+static u8  basfuzz_cli_maxseeds = 0;
 static u8  basfuzz_env_override = 0;
-static u32 basfuzz_max_len     = BASFUZZ_DEFAULT_MAX_LEN;
-static double basfuzz_weight   = BASFUZZ_DEFAULT_WEIGHT;
 static u32 basfuzz_capacity    = 0;
 static u32 basfuzz_count       = 0;
 static struct queue_entry** basfuzz_order = NULL;
@@ -612,6 +618,7 @@ static void basfuzz_release(void) {
 static void basfuzz_mark_dirty(void) {
 
   basfuzz_dirty = 1;
+  mutator_state.basfuzz_counter = 0;
 
 }
 
@@ -674,6 +681,10 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
   double*               gamma = NULL;
   u32                   count;
   u32                   filled;
+  u8                    skip_gamma = 0;
+  u32                   max_len;
+  double                weight;
+  u32                   schedule_count;
 
   matrix.data = NULL;
   matrix.n    = 0;
@@ -684,18 +695,14 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
     return;
   }
 
-  if (!basfuzz_dirty) {
+  if (!basfuzz_dirty) return;
 
-    if (afl && afl->basfuzz_resched_period) {
-      if (queue_cycle < afl->basfuzz_last_cycle ||
-          queue_cycle - afl->basfuzz_last_cycle >= afl->basfuzz_resched_period)
-        basfuzz_dirty = 1;
-      else
-        return;
-    } else {
+  if (afl && afl->basfuzz_interval) {
+    if (afl->basfuzz_counter + 1 < afl->basfuzz_interval) {
+      afl->basfuzz_counter++;
       return;
     }
-
+    afl->basfuzz_counter = 0;
   }
 
   count = build_queue_array(afl, NULL, 0);
@@ -703,10 +710,26 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
   if (count <= 1) {
 
     basfuzz_fallback_to_fifo();
-    if (afl) afl->basfuzz_last_cycle = queue_cycle;
+    if (afl) afl->basfuzz_counter = 0;
     return;
 
   }
+
+  schedule_count = count;
+  if (afl && afl->basfuzz_max_seeds && afl->basfuzz_max_seeds) {
+    if (count > afl->basfuzz_max_seeds) {
+      schedule_count = afl->basfuzz_max_seeds;
+      skip_gamma     = 1;
+    }
+  }
+
+  max_len = BASFUZZ_DEFAULT_MAX_LEN;
+  if (afl && afl->basfuzz_max_len) max_len = afl->basfuzz_max_len;
+
+  weight = BASFUZZ_DEFAULT_WEIGHT;
+  if (afl && afl->basfuzz_h >= 0.0 && afl->basfuzz_h <= 1.0)
+    weight = afl->basfuzz_h;
+  if (skip_gamma && weight <= 0.0) weight = 1.0;
 
   if (count > basfuzz_capacity) {
 
@@ -728,36 +751,40 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
   if (filled != count) {
 
     basfuzz_fallback_to_fifo();
-    if (afl) afl->basfuzz_last_cycle = queue_cycle;
+    if (afl) afl->basfuzz_counter = 0;
     return;
 
   }
 
-  if (basfuzz_build_matrix(afl, basfuzz_order, count,
-                            basfuzz_max_len ? basfuzz_max_len
-                                            : BASFUZZ_DEFAULT_MAX_LEN,
-                            &matrix)) {
+  if (basfuzz_build_matrix(afl, basfuzz_order, schedule_count, max_len,
+                           &matrix)) {
 
     basfuzz_fallback_to_fifo();
-    if (afl) afl->basfuzz_last_cycle = queue_cycle;
+    if (afl) afl->basfuzz_counter = 0;
     basfuzz_free_matrix(&matrix);
     return;
 
   }
 
-  beta  = ck_alloc(sizeof(double) * count);
-  gamma = ck_alloc(sizeof(double) * count);
+  if (schedule_count) {
+    beta = ck_alloc(sizeof(double) * schedule_count);
+    if (!skip_gamma) gamma = ck_alloc(sizeof(double) * schedule_count);
+  }
 
-  if (basfuzz_compute_similarity(&matrix, basfuzz_weight, beta, gamma,
+  if (schedule_count &&
+      basfuzz_compute_similarity(&matrix, weight, beta, gamma,
                                  basfuzz_scores)) {
 
     basfuzz_fallback_to_fifo();
-    if (afl) afl->basfuzz_last_cycle = queue_cycle;
+    if (afl) afl->basfuzz_counter = 0;
     goto cleanup;
 
   }
 
-  basfuzz_sort_queue(basfuzz_order, count, basfuzz_scores);
+  if (schedule_count)
+    basfuzz_sort_queue(basfuzz_order, schedule_count, basfuzz_scores);
+
+  for (u32 i = schedule_count; i < count; ++i) basfuzz_scores[i] = 0.0;
 
   basfuzz_count = count;
 
@@ -765,7 +792,7 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
 
     struct queue_entry* cur = basfuzz_order[i];
 
-    cur->basfuzz_similarity = basfuzz_scores[i];
+    cur->basfuzz_similarity = (i < schedule_count) ? basfuzz_scores[i] : 0.0;
     cur->basfuzz_next = (i + 1 < count) ? basfuzz_order[i + 1] : NULL;
 
   }
@@ -773,11 +800,7 @@ static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
   basfuzz_head  = basfuzz_order[0];
   basfuzz_dirty = 0;
 
-  if (afl) {
-
-    afl->basfuzz_last_cycle = queue_cycle;
-
-  }
+  if (afl) afl->basfuzz_counter = 0;
 
 cleanup:
 
@@ -815,8 +838,9 @@ static struct queue_entry* queue_iteration_next(struct queue_entry* cur) {
 static void maybe_print_basfuzz_settings(void) {
 
   if (basfuzz_enabled)
-    OKF("BASFuzz seed scheduling enabled (h=%.3f, max_len=%u).", basfuzz_weight,
-        basfuzz_max_len);
+    OKF("BASFuzz seed scheduling enabled (h=%.3f, max_len=%u, interval=%u, max_seeds=%u).",
+        mutator_state.basfuzz_h, mutator_state.basfuzz_max_len,
+        mutator_state.basfuzz_interval, mutator_state.basfuzz_max_seeds);
 
 }
 
@@ -9408,9 +9432,11 @@ static void usage(u8* argv0) {
        "  -n            - fuzz without instrumentation (dumb mode)\n"
        "  -x dir        - optional fuzzer dictionary (see README)\n"
        "  -Z mode       - mutation mode selector (default, levy, sa, dir, twise, mi, bandit, use + for combos)\n"
-       "  -Y            - enable BASFuzz similarity-guided seed scheduling\n"
-       "  -y value      - BASFuzz weighting factor h (0.0-1.0, default 0.5)\n"
-       "  -L value      - BASFuzz maximum length d considered per seed (default 10000)\n\n"
+       "  -Y/--basfuzz  - enable BASFuzz similarity-guided seed scheduling\n"
+       "  -y/--basfuzz-h value       - BASFuzz weighting factor h (0.0-1.0, default 0.5)\n"
+       "  -L/--basfuzz-maxlen value  - BASFuzz maximum length d considered per seed (default 10000)\n"
+       "  -I/--basfuzz-interval val  - BASFuzz reorder interval (0 = immediate)\n"
+       "  -J/--basfuzz-maxseeds val  - BASFuzz gamma limit / queue size cap (default 512)\n\n"
 
        "Settings for network protocol fuzzing (AFLNet):\n\n"
 
@@ -10236,7 +10262,33 @@ int main(int argc, char** argv) {
 
   init_mutator_state(&mutator_state);
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:Z:Yy:L:")) > 0)
+  for (int i = 1; i < argc; ++i) {
+
+    if (!strcmp(argv[i], "--basfuzz")) {
+
+      argv[i] = "-Y";
+
+    } else if (!strcmp(argv[i], "--basfuzz-h")) {
+
+      argv[i] = "-y";
+
+    } else if (!strcmp(argv[i], "--basfuzz-maxlen")) {
+
+      argv[i] = "-L";
+
+    } else if (!strcmp(argv[i], "--basfuzz-interval")) {
+
+      argv[i] = "-I";
+
+    } else if (!strcmp(argv[i], "--basfuzz-maxseeds")) {
+
+      argv[i] = "-J";
+
+    }
+
+  }
+
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:Z:Yy:L:I:J:")) > 0)
 
     switch (opt) {
 
@@ -10379,8 +10431,9 @@ int main(int argc, char** argv) {
       case 'Y':
 
         if (basfuzz_cli_enable) FATAL("Multiple -Y options not supported");
-        basfuzz_cli_enable = 1;
-        basfuzz_enabled    = 1;
+        basfuzz_cli_enable        = 1;
+        basfuzz_enabled           = 1;
+        mutator_state.use_basfuzz = 1;
         basfuzz_mark_dirty();
         break;
 
@@ -10389,13 +10442,19 @@ int main(int argc, char** argv) {
           double val;
 
           if (basfuzz_cli_weight) FATAL("Multiple -y options not supported");
-          if (sscanf(optarg, "%lf", &val) != 1) FATAL("Bad syntax used for -y");
-          if (val < 0.0 || val > 1.0)
-            FATAL("BASFuzz weight (-y) must be between 0.0 and 1.0");
+          if (sscanf(optarg, "%lf", &val) != 1)
+            FATAL("Bad syntax used for -y");
 
-          basfuzz_cli_weight = 1;
-          basfuzz_enabled    = 1;
-          basfuzz_weight     = val;
+          if (val < 0.0 || val > 1.0) {
+            WARNF("BASFuzz weight (-y) outside [0.0,1.0], using default %.3f",
+                  BASFUZZ_DEFAULT_WEIGHT);
+            val = BASFUZZ_DEFAULT_WEIGHT;
+          }
+
+          basfuzz_cli_weight        = 1;
+          basfuzz_enabled           = 1;
+          mutator_state.use_basfuzz = 1;
+          mutator_state.basfuzz_h   = val;
           basfuzz_mark_dirty();
 
           break;
@@ -10407,14 +10466,48 @@ int main(int argc, char** argv) {
           u32 val;
 
           if (basfuzz_cli_len) FATAL("Multiple -L options not supported");
-          if (sscanf(optarg, "%u", &val) != 1 || !val)
+          if (sscanf(optarg, "%u", &val) != 1 || !val || optarg[0] == '-')
             FATAL("Bad syntax used for -L");
           if (val > MAX_FILE)
             FATAL("BASFuzz max length (-L) must not exceed MAX_FILE (%u)", MAX_FILE);
 
-          basfuzz_cli_len = 1;
-          basfuzz_enabled = 1;
-          basfuzz_max_len = val;
+          basfuzz_cli_len             = 1;
+          basfuzz_enabled             = 1;
+          mutator_state.use_basfuzz   = 1;
+          mutator_state.basfuzz_max_len = val;
+          basfuzz_mark_dirty();
+
+          break;
+
+        }
+
+      case 'I': {
+
+          u32 val;
+
+          if (basfuzz_cli_interval) FATAL("Multiple -I options not supported");
+          if (sscanf(optarg, "%u", &val) != 1 || optarg[0] == '-')
+            FATAL("Bad syntax used for -I");
+
+          basfuzz_cli_interval        = 1;
+          mutator_state.basfuzz_interval = val;
+          mutator_state.basfuzz_counter  = 0;
+          basfuzz_mark_dirty();
+
+          break;
+
+        }
+
+      case 'J': {
+
+          u32 val;
+
+          if (basfuzz_cli_maxseeds) FATAL("Multiple -J options not supported");
+          if (sscanf(optarg, "%u", &val) != 1 || optarg[0] == '-')
+            FATAL("Bad syntax used for -J");
+
+          basfuzz_cli_maxseeds       = 1;
+          mutator_state.basfuzz_max_seeds = val;
           basfuzz_mark_dirty();
 
           break;
@@ -10632,7 +10725,13 @@ int main(int argc, char** argv) {
 
     if (env) {
       basfuzz_env_override = 1;
-      if (atoi(env)) basfuzz_enabled = 1; else basfuzz_enabled = 0;
+      if (atoi(env)) {
+        basfuzz_enabled             = 1;
+        mutator_state.use_basfuzz   = 1;
+      } else {
+        basfuzz_enabled             = 0;
+        mutator_state.use_basfuzz   = 0;
+      }
       basfuzz_mark_dirty();
     }
 
@@ -10645,8 +10744,11 @@ int main(int argc, char** argv) {
     if (env) {
       double val = atof(env);
       if (val >= 0.0 && val <= 1.0) {
-        if (!basfuzz_env_override || basfuzz_enabled) basfuzz_enabled = 1;
-        basfuzz_weight = val;
+        if (!basfuzz_env_override || basfuzz_enabled) {
+          basfuzz_enabled             = 1;
+          mutator_state.use_basfuzz   = 1;
+          mutator_state.basfuzz_h     = val;
+        }
         basfuzz_mark_dirty();
       }
     }
@@ -10660,13 +10762,43 @@ int main(int argc, char** argv) {
     if (env) {
       u32 val = (u32)atoi(env);
       if (val >= 1 && val <= MAX_FILE) {
-        if (!basfuzz_env_override || basfuzz_enabled) basfuzz_enabled = 1;
-        basfuzz_max_len = val;
+        if (!basfuzz_env_override || basfuzz_enabled) {
+          basfuzz_enabled               = 1;
+          mutator_state.use_basfuzz     = 1;
+          mutator_state.basfuzz_max_len = val;
+        }
         basfuzz_mark_dirty();
       }
     }
 
   }
+
+  if (!basfuzz_cli_interval) {
+
+    char* env = getenv("AFL_BASFUZZ_INTERVAL");
+
+    if (env && env[0] != '-') {
+      u32 val = (u32)atoi(env);
+      mutator_state.basfuzz_interval = val;
+      mutator_state.basfuzz_counter  = 0;
+      basfuzz_mark_dirty();
+    }
+
+  }
+
+  if (!basfuzz_cli_maxseeds) {
+
+    char* env = getenv("AFL_BASFUZZ_MAX_SEEDS");
+
+    if (env && env[0] != '-') {
+      u32 val = (u32)atoi(env);
+      mutator_state.basfuzz_max_seeds = val;
+      basfuzz_mark_dirty();
+    }
+
+  }
+
+  basfuzz_enabled = mutator_state.use_basfuzz;
 
   configure_mutator_state(&mutator_state);
   ensure_mutator_buffers(&mutator_state);

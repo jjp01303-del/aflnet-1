@@ -25,6 +25,7 @@ int basfuzz_compute_similarity(struct basfuzz_matrix* m,
                                double* beta,
                                double* gamma,
                                double* scores);
+/* Pass gamma == NULL to skip the structural component. */
 
 void basfuzz_sort_queue(struct queue_entry** queue_array,
                         u32 queue_len,

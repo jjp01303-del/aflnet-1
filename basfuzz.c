@@ -163,15 +163,22 @@ int basfuzz_compute_similarity(struct basfuzz_matrix* m,
                                double* gamma,
                                double* scores) {
 
-  if (!m || !beta || !gamma || !scores) return -1;
+  if (!m || !beta || !scores) return -1;
 
   if (h < 0.0 || h > 1.0) h = 0.5;
 
   basfuzz_compute_beta(m, beta);
-  basfuzz_compute_gamma(m, gamma);
 
-  for (u32 i = 0; i < m->n; ++i)
-    scores[i] = h * beta[i] + (1.0 - h) * gamma[i];
+  if (gamma) {
+    basfuzz_compute_gamma(m, gamma);
+  } else {
+    h = 1.0;
+  }
+
+  for (u32 i = 0; i < m->n; ++i) {
+    double g = gamma ? gamma[i] : 0.0;
+    scores[i] = h * beta[i] + (1.0 - h) * g;
+  }
 
   return 0;
 
