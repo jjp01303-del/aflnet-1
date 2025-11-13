@@ -87,6 +87,10 @@ typedef struct afl_state {
   u32        *dir_temp_positions;
   u8         *dir_temp_values;
 
+  /* BASFuzz scheduler bookkeeping */
+  u64 basfuzz_last_cycle;
+  u32 basfuzz_resched_period;
+
 } afl_state_t;
 
 #endif /* AFL_FUZZ_H */

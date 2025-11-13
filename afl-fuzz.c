@@ -43,6 +43,7 @@
 #include "alloc-inl.h"
 #include "hash.h"
 #include "afl-fuzz.h"
+#include "basfuzz.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -293,6 +294,9 @@ static void init_mutator_state(afl_state_t* afl) {
   afl->dir_candidate_ptr       = NULL;
   afl->dir_candidate_len       = 0;
   afl->dir_collect             = 0;
+
+  afl->basfuzz_last_cycle     = 0;
+  afl->basfuzz_resched_period = 0;
 
 }
 
@@ -630,66 +634,79 @@ static void basfuzz_fallback_to_fifo(void) {
 
 }
 
-struct basfuzz_pair {
+static u32 build_queue_array(struct afl_state* afl, struct queue_entry** out_array,
+                             u32 max_len) {
 
-  struct queue_entry* q;
-  double              score;
+  (void)afl;
 
-};
+  /* Produce a flat view of the queue; when out_array is NULL we simply count
+     entries, otherwise we copy up to max_len pointers into the caller buffer. */
+  struct queue_entry* q = queue;
+  u32                 count = 0;
+  u32                 limit = max_len ? max_len : UINT32_MAX;
 
-static int basfuzz_compare(const void* a, const void* b) {
+  while (q) {
 
-  const struct basfuzz_pair* pa = (const struct basfuzz_pair*)a;
-  const struct basfuzz_pair* pb = (const struct basfuzz_pair*)b;
+    if (out_array && count < limit) out_array[count] = q;
+    count++;
 
-  if (pa->score < pb->score) return -1;
-  if (pa->score > pb->score) return 1;
-  if (pa->q < pb->q) return -1;
-  if (pa->q > pb->q) return 1;
-  return 0;
+    if (out_array && count >= limit && q->next) {
+      WARNF("BASFuzz: queue truncated to %u entries for scheduling", limit);
+      break;
+    }
+
+    q = q->next;
+
+  }
+
+  return count;
 
 }
 
-static void basfuzz_prepare(void) {
+/* We adopt scheduling scheme B: rebuild a similarity-ranked global order and
+   expose it via the queue iteration helpers. AFLNet's state-aware heuristics
+   already use these helpers, so we can reorder seeds without altering the
+   protocol-state scheduler's semantics. */
+static void maybe_reschedule_queue_with_basfuzz(struct afl_state* afl) {
 
-  struct queue_entry* q;
-  u32                 count = 0;
-  u32                 row_len;
-  size_t              matrix_bytes;
-  size_t              freq_cells;
-  u8*                 matrix = NULL;
-  u32*                freq = NULL;
-  struct basfuzz_pair* pairs = NULL;
-  u32                 idx;
+  struct basfuzz_matrix matrix;
+  double*               beta  = NULL;
+  double*               gamma = NULL;
+  u32                   count;
+  u32                   filled;
+
+  matrix.data = NULL;
+  matrix.n    = 0;
+  matrix.d    = 0;
 
   if (!basfuzz_enabled) {
     basfuzz_fallback_to_fifo();
     return;
   }
 
-  if (!basfuzz_dirty) return;
+  if (!basfuzz_dirty) {
 
-  for (q = queue; q; q = q->next) count++;
+    if (afl && afl->basfuzz_resched_period) {
+      if (queue_cycle < afl->basfuzz_last_cycle ||
+          queue_cycle - afl->basfuzz_last_cycle >= afl->basfuzz_resched_period)
+        basfuzz_dirty = 1;
+      else
+        return;
+    } else {
+      return;
+    }
 
-  basfuzz_count = count;
-
-  if (!count) {
-    basfuzz_head  = NULL;
-    basfuzz_dirty = 0;
-    return;
   }
 
-  row_len = basfuzz_max_len ? basfuzz_max_len : BASFUZZ_DEFAULT_MAX_LEN;
-  if (!row_len) row_len = BASFUZZ_DEFAULT_MAX_LEN;
+  count = build_queue_array(afl, NULL, 0);
 
-  if ((size_t)count > SIZE_MAX / row_len || (size_t)row_len > SIZE_MAX / 256) {
-    WARNF("BASFuzz scheduling disabled for this round (n=%u, d=%u).", count, row_len);
+  if (count <= 1) {
+
     basfuzz_fallback_to_fifo();
+    if (afl) afl->basfuzz_last_cycle = queue_cycle;
     return;
-  }
 
-  matrix_bytes = (size_t)count * row_len;
-  freq_cells   = (size_t)row_len * 256;
+  }
 
   if (count > basfuzz_capacity) {
 
@@ -707,102 +724,74 @@ static void basfuzz_prepare(void) {
 
   }
 
-  matrix = ck_alloc(matrix_bytes);
-  memset(matrix, 0, matrix_bytes);
+  filled = build_queue_array(afl, basfuzz_order, basfuzz_capacity);
+  if (filled != count) {
 
-  freq = ck_alloc(sizeof(u32) * freq_cells);
-  memset(freq, 0, sizeof(u32) * freq_cells);
-
-  idx = 0;
-  for (q = queue; q; q = q->next, ++idx) {
-
-    u8* row = matrix + (size_t)idx * row_len;
-    u32 remaining = row_len;
-
-    basfuzz_order[idx] = q;
-
-    if (row_len) {
-
-      s32 fd = open((char*)q->fname, O_RDONLY);
-
-      if (fd < 0) PFATAL("Unable to open '%s'", q->fname);
-
-      while (remaining) {
-
-        ssize_t rd = read(fd, row + (row_len - remaining), remaining);
-
-        if (rd < 0) {
-          s32 saved = errno;
-          close(fd);
-          errno = saved;
-          PFATAL("Unable to read '%s'", q->fname);
-        }
-
-        if (!rd) break;
-        if ((u32)rd > remaining) rd = remaining;
-        remaining -= (u32)rd;
-
-      }
-
-      close(fd);
-
-    }
-
-    for (u32 k = 0; k < row_len; ++k)
-      freq[(size_t)k * 256 + row[k]]++;
+    basfuzz_fallback_to_fifo();
+    if (afl) afl->basfuzz_last_cycle = queue_cycle;
+    return;
 
   }
 
-  pairs = ck_alloc(sizeof(struct basfuzz_pair) * count);
+  if (basfuzz_build_matrix(afl, basfuzz_order, count,
+                            basfuzz_max_len ? basfuzz_max_len
+                                            : BASFUZZ_DEFAULT_MAX_LEN,
+                            &matrix)) {
 
-  for (idx = 0; idx < count; ++idx) {
-
-    u8* row = matrix + (size_t)idx * row_len;
-    u64 sum = 0;
-
-    for (u32 k = 0; k < row_len; ++k)
-      sum += freq[(size_t)k * 256 + row[k]];
-
-    double beta = (double)sum / (double)count;
-    double gamma = (double)sum / (double)row_len;
-    double similarity = basfuzz_weight * beta + (1.0 - basfuzz_weight) * gamma;
-
-    pairs[idx].q     = basfuzz_order[idx];
-    pairs[idx].score = similarity;
+    basfuzz_fallback_to_fifo();
+    if (afl) afl->basfuzz_last_cycle = queue_cycle;
+    basfuzz_free_matrix(&matrix);
+    return;
 
   }
 
-  qsort(pairs, count, sizeof(struct basfuzz_pair), basfuzz_compare);
+  beta  = ck_alloc(sizeof(double) * count);
+  gamma = ck_alloc(sizeof(double) * count);
 
-  for (idx = 0; idx < count; ++idx) {
+  if (basfuzz_compute_similarity(&matrix, basfuzz_weight, beta, gamma,
+                                 basfuzz_scores)) {
 
-    basfuzz_order[idx]  = pairs[idx].q;
-    basfuzz_scores[idx] = pairs[idx].score;
+    basfuzz_fallback_to_fifo();
+    if (afl) afl->basfuzz_last_cycle = queue_cycle;
+    goto cleanup;
 
   }
 
-  for (idx = 0; idx < count; ++idx) {
+  basfuzz_sort_queue(basfuzz_order, count, basfuzz_scores);
 
-    struct queue_entry* cur = basfuzz_order[idx];
+  basfuzz_count = count;
 
-    cur->basfuzz_similarity = basfuzz_scores[idx];
-    cur->basfuzz_next = (idx + 1 < count) ? basfuzz_order[idx + 1] : NULL;
+  for (u32 i = 0; i < count; ++i) {
+
+    struct queue_entry* cur = basfuzz_order[i];
+
+    cur->basfuzz_similarity = basfuzz_scores[i];
+    cur->basfuzz_next = (i + 1 < count) ? basfuzz_order[i + 1] : NULL;
 
   }
 
   basfuzz_head  = basfuzz_order[0];
   basfuzz_dirty = 0;
 
-  ck_free(pairs);
-  ck_free(freq);
-  ck_free(matrix);
+  if (afl) {
+
+    afl->basfuzz_last_cycle = queue_cycle;
+
+  }
+
+cleanup:
+
+  if (gamma) ck_free(gamma);
+  if (beta) ck_free(beta);
+  basfuzz_free_matrix(&matrix);
 
 }
 
 static struct queue_entry* queue_iteration_start(void) {
 
   if (basfuzz_enabled) {
-    basfuzz_prepare();
+    /* BASFuzz scheduling hook: refresh similarity-ranked order here. */
+    maybe_reschedule_queue_with_basfuzz(&mutator_state);
     if (basfuzz_head) return basfuzz_head;
   }
 
@@ -815,7 +804,7 @@ static struct queue_entry* queue_iteration_next(struct queue_entry* cur) {
   if (!cur) return queue_iteration_start();
 
   if (basfuzz_enabled) {
-    if (basfuzz_dirty) basfuzz_prepare();
+    if (basfuzz_dirty) maybe_reschedule_queue_with_basfuzz(&mutator_state);
     return cur->basfuzz_next;
   }
 

@@ -210,7 +210,12 @@ void basfuzz_sort_queue(struct queue_entry** queue_array,
 
   qsort(items, queue_len, sizeof(struct basfuzz_item), basfuzz_item_cmp);
 
-  for (u32 i = 0; i < queue_len; ++i) queue_array[i] = items[i].qe;
+  for (u32 i = 0; i < queue_len; ++i) {
+
+    queue_array[i] = items[i].qe;
+    scores[i]      = items[i].score;
+
+  }
 
   ck_free(items);
 
