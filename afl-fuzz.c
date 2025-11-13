@@ -69,6 +69,7 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 #include <sys/capability.h>
+#include <limits.h>
 
 #include "aflnet.h"
 #include <graphviz/gvc.h>
@@ -86,6 +87,10 @@
 #define MUTATOR_DIR_DEFAULT_MAX_DIFF       32U
 #define MUTATOR_DIR_DEFAULT_COMBINE        3U
 #define MUTATOR_DIR_DEFAULT_EXEC_ROUNDS    8U
+#define BASFUZZ_DEFAULT_MAX_LEN            10000U
+#define BASFUZZ_DEFAULT_WEIGHT             0.5
+
+struct queue_entry;
 
 enum {
   TWISE_CAT_NORMAL = 0,
@@ -555,7 +560,24 @@ struct queue_entry {
   u8 is_initial_seed;                 /* Is this an initial seed */
   u32 unique_state_count;             /* Unique number of states traversed by this queue entry */
 
+  double basfuzz_similarity;          /* Similarity score used by basfuzz scheduler */
+  struct queue_entry *basfuzz_next;   /* Next entry in basfuzz order */
+
 };
+
+static u8  basfuzz_enabled     = 0;
+static u8  basfuzz_dirty       = 1;
+static u8  basfuzz_cli_enable  = 0;
+static u8  basfuzz_cli_weight  = 0;
+static u8  basfuzz_cli_len     = 0;
+static u8  basfuzz_env_override = 0;
+static u32 basfuzz_max_len     = BASFUZZ_DEFAULT_MAX_LEN;
+static double basfuzz_weight   = BASFUZZ_DEFAULT_WEIGHT;
+static u32 basfuzz_capacity    = 0;
+static u32 basfuzz_count       = 0;
+static struct queue_entry** basfuzz_order = NULL;
+static double* basfuzz_scores  = NULL;
+static struct queue_entry* basfuzz_head = NULL;
 
 static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
                           *queue_cur, /* Current offset within the queue  */
@@ -564,6 +586,250 @@ static struct queue_entry *queue,     /* Fuzzing queue (linked list)      */
 
 static struct queue_entry*
   top_rated[MAP_SIZE];                /* Top entries for bitmap bytes     */
+
+static void basfuzz_release(void) {
+
+  if (basfuzz_order) {
+    ck_free(basfuzz_order);
+    basfuzz_order = NULL;
+  }
+
+  if (basfuzz_scores) {
+    ck_free(basfuzz_scores);
+    basfuzz_scores = NULL;
+  }
+
+  basfuzz_capacity = 0;
+  basfuzz_count = 0;
+  basfuzz_head = NULL;
+
+}
+
+static void basfuzz_mark_dirty(void) {
+
+  basfuzz_dirty = 1;
+
+}
+
+static void basfuzz_fallback_to_fifo(void) {
+
+  struct queue_entry* q = queue;
+
+  basfuzz_head   = queue;
+  basfuzz_count  = 0;
+  basfuzz_dirty  = 0;
+
+  while (q) {
+
+    q->basfuzz_next       = q->next;
+    q->basfuzz_similarity = 0.0;
+    basfuzz_count++;
+    q = q->next;
+
+  }
+
+}
+
+struct basfuzz_pair {
+
+  struct queue_entry* q;
+  double              score;
+
+};
+
+static int basfuzz_compare(const void* a, const void* b) {
+
+  const struct basfuzz_pair* pa = (const struct basfuzz_pair*)a;
+  const struct basfuzz_pair* pb = (const struct basfuzz_pair*)b;
+
+  if (pa->score < pb->score) return -1;
+  if (pa->score > pb->score) return 1;
+  if (pa->q < pb->q) return -1;
+  if (pa->q > pb->q) return 1;
+  return 0;
+
+}
+
+static void basfuzz_prepare(void) {
+
+  struct queue_entry* q;
+  u32                 count = 0;
+  u32                 row_len;
+  size_t              matrix_bytes;
+  size_t              freq_cells;
+  u8*                 matrix = NULL;
+  u32*                freq = NULL;
+  struct basfuzz_pair* pairs = NULL;
+  u32                 idx;
+
+  if (!basfuzz_enabled) {
+    basfuzz_fallback_to_fifo();
+    return;
+  }
+
+  if (!basfuzz_dirty) return;
+
+  for (q = queue; q; q = q->next) count++;
+
+  basfuzz_count = count;
+
+  if (!count) {
+    basfuzz_head  = NULL;
+    basfuzz_dirty = 0;
+    return;
+  }
+
+  row_len = basfuzz_max_len ? basfuzz_max_len : BASFUZZ_DEFAULT_MAX_LEN;
+  if (!row_len) row_len = BASFUZZ_DEFAULT_MAX_LEN;
+
+  if ((size_t)count > SIZE_MAX / row_len || (size_t)row_len > SIZE_MAX / 256) {
+    WARNF("BASFuzz scheduling disabled for this round (n=%u, d=%u).", count, row_len);
+    basfuzz_fallback_to_fifo();
+    return;
+  }
+
+  matrix_bytes = (size_t)count * row_len;
+  freq_cells   = (size_t)row_len * 256;
+
+  if (count > basfuzz_capacity) {
+
+    if (basfuzz_order)
+      basfuzz_order = ck_realloc(basfuzz_order, sizeof(struct queue_entry*) * count);
+    else
+      basfuzz_order = ck_alloc(sizeof(struct queue_entry*) * count);
+
+    if (basfuzz_scores)
+      basfuzz_scores = ck_realloc(basfuzz_scores, sizeof(double) * count);
+    else
+      basfuzz_scores = ck_alloc(sizeof(double) * count);
+
+    basfuzz_capacity = count;
+
+  }
+
+  matrix = ck_alloc(matrix_bytes);
+  memset(matrix, 0, matrix_bytes);
+
+  freq = ck_alloc(sizeof(u32) * freq_cells);
+  memset(freq, 0, sizeof(u32) * freq_cells);
+
+  idx = 0;
+  for (q = queue; q; q = q->next, ++idx) {
+
+    u8* row = matrix + (size_t)idx * row_len;
+    u32 remaining = row_len;
+
+    basfuzz_order[idx] = q;
+
+    if (row_len) {
+
+      s32 fd = open((char*)q->fname, O_RDONLY);
+
+      if (fd < 0) PFATAL("Unable to open '%s'", q->fname);
+
+      while (remaining) {
+
+        ssize_t rd = read(fd, row + (row_len - remaining), remaining);
+
+        if (rd < 0) {
+          s32 saved = errno;
+          close(fd);
+          errno = saved;
+          PFATAL("Unable to read '%s'", q->fname);
+        }
+
+        if (!rd) break;
+        if ((u32)rd > remaining) rd = remaining;
+        remaining -= (u32)rd;
+
+      }
+
+      close(fd);
+
+    }
+
+    for (u32 k = 0; k < row_len; ++k)
+      freq[(size_t)k * 256 + row[k]]++;
+
+  }
+
+  pairs = ck_alloc(sizeof(struct basfuzz_pair) * count);
+
+  for (idx = 0; idx < count; ++idx) {
+
+    u8* row = matrix + (size_t)idx * row_len;
+    u64 sum = 0;
+
+    for (u32 k = 0; k < row_len; ++k)
+      sum += freq[(size_t)k * 256 + row[k]];
+
+    double beta = (double)sum / (double)count;
+    double gamma = (double)sum / (double)row_len;
+    double similarity = basfuzz_weight * beta + (1.0 - basfuzz_weight) * gamma;
+
+    pairs[idx].q     = basfuzz_order[idx];
+    pairs[idx].score = similarity;
+
+  }
+
+  qsort(pairs, count, sizeof(struct basfuzz_pair), basfuzz_compare);
+
+  for (idx = 0; idx < count; ++idx) {
+
+    basfuzz_order[idx]  = pairs[idx].q;
+    basfuzz_scores[idx] = pairs[idx].score;
+
+  }
+
+  for (idx = 0; idx < count; ++idx) {
+
+    struct queue_entry* cur = basfuzz_order[idx];
+
+    cur->basfuzz_similarity = basfuzz_scores[idx];
+    cur->basfuzz_next = (idx + 1 < count) ? basfuzz_order[idx + 1] : NULL;
+
+  }
+
+  basfuzz_head  = basfuzz_order[0];
+  basfuzz_dirty = 0;
+
+  ck_free(pairs);
+  ck_free(freq);
+  ck_free(matrix);
+
+}
+
+static struct queue_entry* queue_iteration_start(void) {
+
+  if (basfuzz_enabled) {
+    basfuzz_prepare();
+    if (basfuzz_head) return basfuzz_head;
+  }
+
+  return queue;
+
+}
+
+static struct queue_entry* queue_iteration_next(struct queue_entry* cur) {
+
+  if (!cur) return queue_iteration_start();
+
+  if (basfuzz_enabled) {
+    if (basfuzz_dirty) basfuzz_prepare();
+    return cur->basfuzz_next;
+  }
+
+  return cur->next;
+
+}
+
+static void maybe_print_basfuzz_settings(void) {
+
+  if (basfuzz_enabled)
+    OKF("BASFuzz seed scheduling enabled (h=%.3f, max_len=%u).", basfuzz_weight,
+        basfuzz_max_len);
+
+}
 
 struct extra_data {
   u8* data;                           /* Dictionary token data            */
@@ -1866,6 +2132,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->index        = queued_paths;
   q->generating_state_id = target_state_id;
   q->is_initial_seed = 0;
+  q->basfuzz_similarity = 0.0;
+  q->basfuzz_next = NULL;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -1927,6 +2195,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
     //Also add a new row (for state 0) if needed
     expand_was_fuzzed_map(1, 1);
   }
+
+  basfuzz_mark_dirty();
 }
 
 
@@ -1935,6 +2205,8 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
 EXP_ST void destroy_queue(void) {
 
   struct queue_entry *q = queue, *n;
+
+  basfuzz_release();
 
   while (q) {
 
@@ -9146,7 +9418,10 @@ static void usage(u8* argv0) {
        "  -d            - quick & dirty mode (skips deterministic steps)\n"
        "  -n            - fuzz without instrumentation (dumb mode)\n"
        "  -x dir        - optional fuzzer dictionary (see README)\n"
-       "  -Z mode       - mutation mode selector (default, levy, sa, dir, twise, mi, bandit, use + for combos)\n\n"
+       "  -Z mode       - mutation mode selector (default, levy, sa, dir, twise, mi, bandit, use + for combos)\n"
+       "  -Y            - enable BASFuzz similarity-guided seed scheduling\n"
+       "  -y value      - BASFuzz weighting factor h (0.0-1.0, default 0.5)\n"
+       "  -L value      - BASFuzz maximum length d considered per seed (default 10000)\n\n"
 
        "Settings for network protocol fuzzing (AFLNet):\n\n"
 
@@ -9972,7 +10247,7 @@ int main(int argc, char** argv) {
 
   init_mutator_state(&mutator_state);
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:Z:")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:Z:Yy:L:")) > 0)
 
     switch (opt) {
 
@@ -10111,6 +10386,51 @@ int main(int argc, char** argv) {
         in_bitmap = optarg;
         read_bitmap(in_bitmap);
         break;
+
+      case 'Y':
+
+        if (basfuzz_cli_enable) FATAL("Multiple -Y options not supported");
+        basfuzz_cli_enable = 1;
+        basfuzz_enabled    = 1;
+        basfuzz_mark_dirty();
+        break;
+
+      case 'y': {
+
+          double val;
+
+          if (basfuzz_cli_weight) FATAL("Multiple -y options not supported");
+          if (sscanf(optarg, "%lf", &val) != 1) FATAL("Bad syntax used for -y");
+          if (val < 0.0 || val > 1.0)
+            FATAL("BASFuzz weight (-y) must be between 0.0 and 1.0");
+
+          basfuzz_cli_weight = 1;
+          basfuzz_enabled    = 1;
+          basfuzz_weight     = val;
+          basfuzz_mark_dirty();
+
+          break;
+
+        }
+
+      case 'L': {
+
+          u32 val;
+
+          if (basfuzz_cli_len) FATAL("Multiple -L options not supported");
+          if (sscanf(optarg, "%u", &val) != 1 || !val)
+            FATAL("Bad syntax used for -L");
+          if (val > MAX_FILE)
+            FATAL("BASFuzz max length (-L) must not exceed MAX_FILE (%u)", MAX_FILE);
+
+          basfuzz_cli_len = 1;
+          basfuzz_enabled = 1;
+          basfuzz_max_len = val;
+          basfuzz_mark_dirty();
+
+          break;
+
+        }
 
       case 'Z': /* mutator mode selection */
 
@@ -10317,10 +10637,53 @@ int main(int argc, char** argv) {
 
   }
 
+  if (!basfuzz_cli_enable) {
+
+    char* env = getenv("AFL_BASFUZZ");
+
+    if (env) {
+      basfuzz_env_override = 1;
+      if (atoi(env)) basfuzz_enabled = 1; else basfuzz_enabled = 0;
+      basfuzz_mark_dirty();
+    }
+
+  }
+
+  if (!basfuzz_cli_weight) {
+
+    char* env = getenv("AFL_BASFUZZ_WEIGHT");
+
+    if (env) {
+      double val = atof(env);
+      if (val >= 0.0 && val <= 1.0) {
+        if (!basfuzz_env_override || basfuzz_enabled) basfuzz_enabled = 1;
+        basfuzz_weight = val;
+        basfuzz_mark_dirty();
+      }
+    }
+
+  }
+
+  if (!basfuzz_cli_len) {
+
+    char* env = getenv("AFL_BASFUZZ_MAX_LEN");
+
+    if (env) {
+      u32 val = (u32)atoi(env);
+      if (val >= 1 && val <= MAX_FILE) {
+        if (!basfuzz_env_override || basfuzz_enabled) basfuzz_enabled = 1;
+        basfuzz_max_len = val;
+        basfuzz_mark_dirty();
+      }
+    }
+
+  }
+
   configure_mutator_state(&mutator_state);
   ensure_mutator_buffers(&mutator_state);
 
   maybe_print_mutator_modes(&mutator_state);
+  maybe_print_basfuzz_settings();
 
   //AFLNet - Check for required arguments
   if (!use_net) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
@@ -10489,16 +10852,16 @@ int main(int argc, char** argv) {
           if (!queue_cur) {
               current_entry     = 0;
               cur_skipped_paths = 0;
-              queue_cur         = queue;
+              queue_cur         = queue_iteration_start();
               queue_cycle++;
           }
-          while (queue_cur != selected_seed) {
-            queue_cur = queue_cur->next;
+          while (queue_cur && queue_cur != selected_seed) {
+            queue_cur = queue_iteration_next(queue_cur);
             current_entry++;
             if (!queue_cur) {
               current_entry     = 0;
               cur_skipped_paths = 0;
-              queue_cur         = queue;
+              queue_cur         = queue_iteration_start();
               queue_cycle++;
             }
           }
@@ -10514,12 +10877,13 @@ int main(int argc, char** argv) {
           queue_cycle++;
           current_entry     = 0;
           cur_skipped_paths = 0;
-          queue_cur         = queue;
+          queue_cur         = queue_iteration_start();
 
-          while (seek_to) {
+          while (seek_to && queue_cur) {
             current_entry++;
             seek_to--;
-            queue_cur = queue_cur->next;
+            queue_cur = queue_iteration_next(queue_cur);
+            if (!queue_cur) queue_cur = queue_iteration_start();
           }
 
           show_stats();
@@ -10557,7 +10921,7 @@ int main(int argc, char** argv) {
       if (stop_soon) break;
 
       if (code_aware_schedule){
-        queue_cur = queue_cur->next;
+        queue_cur = queue_iteration_next(queue_cur);
         current_entry++;
       }
     }
@@ -10592,16 +10956,16 @@ int main(int argc, char** argv) {
         if (!queue_cur) {
             current_entry     = 0;
             cur_skipped_paths = 0;
-            queue_cur         = queue;
+            queue_cur         = queue_iteration_start();
             queue_cycle++;
         }
-        while (queue_cur != selected_seed) {
-          queue_cur = queue_cur->next;
+        while (queue_cur && queue_cur != selected_seed) {
+          queue_cur = queue_iteration_next(queue_cur);
           current_entry++;
           if (!queue_cur) {
             current_entry     = 0;
             cur_skipped_paths = 0;
-            queue_cur         = queue;
+            queue_cur         = queue_iteration_start();
             queue_cycle++;
           }
         }
@@ -10632,12 +10996,13 @@ int main(int argc, char** argv) {
         queue_cycle++;
         current_entry     = 0;
         cur_skipped_paths = 0;
-        queue_cur         = queue;
+        queue_cur         = queue_iteration_start();
 
-        while (seek_to) {
+        while (seek_to && queue_cur) {
           current_entry++;
           seek_to--;
-          queue_cur = queue_cur->next;
+          queue_cur = queue_iteration_next(queue_cur);
+          if (!queue_cur) queue_cur = queue_iteration_start();
         }
 
         show_stats();
@@ -10676,7 +11041,7 @@ int main(int argc, char** argv) {
 
       if (stop_soon) break;
 
-      queue_cur = queue_cur->next;
+      queue_cur = queue_iteration_next(queue_cur);
       current_entry++;
 
     }
